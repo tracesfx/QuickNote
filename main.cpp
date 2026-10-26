@@ -187,7 +187,7 @@ bool ParseHotkey(const wchar_t* text, Hotkey* hotkey) {
     return hotkey->vk != 0;
 }
 
-// ---- Settings (%AppData%\QuickNote\settings.ini) ----
+// ---- Settings (QuickNote.ini next to the exe) ----
 
 void SaveSettings() {
     const Settings& s = g_settings;
@@ -200,23 +200,33 @@ void SaveSettings() {
     WritePrivateProfileStringW(kAppName, L"StartWithWindows", s.startWithWindows ? L"1" : L"0", s.file);
 }
 
+// A new settings file starts with a UTF-16 BOM so Windows writes the INI as Unicode, not ANSI.
+bool CreateSettingsFile(const wchar_t* path) {
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        return false;
+    DWORD written;
+    WriteFile(f, "\xFF\xFE", 2, &written, nullptr);
+    CloseHandle(f);
+    return true;
+}
+
 void LoadSettings() {
     Settings& s = g_settings;
-    wchar_t folder[MAX_PATH];
-    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, folder);
-    wcscat_s(folder, L"\\QuickNote");
-    CreateDirectoryW(folder, nullptr);
-    swprintf_s(s.file, L"%ls\\settings.ini", folder);
+    // Settings live next to the exe, so QuickNote can be copied around as one folder.
+    GetModuleFileNameW(nullptr, s.file, MAX_PATH);
+    wchar_t* name = wcsrchr(s.file, L'\\') + 1;
+    wcscpy_s(name, MAX_PATH - (name - s.file), L"QuickNote.ini");
 
-    // A new file starts with a UTF-16 BOM so Windows writes the INI as Unicode, not ANSI.
-    bool firstRun = GetFileAttributesW(s.file) == INVALID_FILE_ATTRIBUTES;
-    if (firstRun) {
-        HANDLE f = CreateFileW(s.file, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (f != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(f, "\xFF\xFE", 2, &written, nullptr);
-            CloseHandle(f);
-        }
+    if (GetFileAttributesW(s.file) == INVALID_FILE_ATTRIBUTES && !CreateSettingsFile(s.file)) {
+        // The exe's folder isn't writable (e.g. Program Files), so use %AppData%\QuickNote instead.
+        wchar_t folder[MAX_PATH];
+        SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, folder);
+        wcscat_s(folder, L"\\QuickNote");
+        CreateDirectoryW(folder, nullptr);
+        swprintf_s(s.file, L"%ls\\QuickNote.ini", folder);
+        if (GetFileAttributesW(s.file) == INVALID_FILE_ATTRIBUTES)
+            CreateSettingsFile(s.file);
     }
 
     wchar_t defaultFolder[MAX_PATH];

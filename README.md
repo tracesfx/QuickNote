@@ -12,7 +12,7 @@ Press **Ctrl+Space** anywhere, type a note, press **Enter**. The note is added t
 Press **Ctrl+K** in the note box, or choose **Change shortcuts…** from the tray menu. Press the new-note shortcut, then the open-folder shortcut. Press Enter at either step to keep the current one, or Esc to cancel. QuickNote rejects combinations that another app already uses, that would override everyday shortcuts (Ctrl+C, Alt+F4, …), or that have no Ctrl, Alt or Win key.
 
 ## Settings
-`%AppData%\QuickNote\settings.ini`:
+Settings are saved in `QuickNote.ini` next to `QuickNote.exe`, so the app can be copied or shared as one folder. Hand out just the exe and the INI is created on first run. If the exe's folder isn't writable (e.g. Program Files), QuickNote uses `%AppData%\QuickNote\QuickNote.ini` instead.
 
 ```ini
 [QuickNote]
@@ -34,4 +34,4 @@ build.bat   -> build\QuickNote.exe
 The build links the C runtime from `ucrtbase.dll`, which is part of Windows 10/11, so no Visual C++ Redistributable is needed.
 
 ## Smart App Control
-QuickNote is unsigned. Smart App Control on Windows 11 judges each build by its content, not its build timestamp, so rebuilding the same source gets the same verdict. Features are added one or two at a time, and each commit message records whether Smart App Control allowed that build. To go back to a version that runs, check out a commit marked `SAC: allowed` and rebuild.
+QuickNote is unsigned, so on PCs with Smart App Control turned on, Windows may block it. The verdict isn't predictable. Each commit message records whether the build was allowed when it was tested on the development PC, but a fresh build of the same source can still get a different verdict: one source version was allowed on its first build and blocked on its second. Once a particular exe has been allowed on a PC, that file, and copies of it, keep running there. Other PCs with Smart App Control on decide for themselves. PCs where it is off or in evaluation mode run QuickNote normally.
