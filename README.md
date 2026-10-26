@@ -4,6 +4,7 @@ Press **Ctrl+Space** anywhere, type a note, press **Enter**. The note is added t
 
 - **Esc**, or clicking away, cancels.
 - Notes go to `Documents\QuickNotes\YYYY-MM-DD.txt` by default, one line per note: `[14:32:07] check the glow on shot 12`
+- In the box, **Ctrl+Backspace / Ctrl+Delete** delete a word at a time. **Ctrl+Z** undoes (a word at a time), and **Ctrl+Y** or **Ctrl+Shift+Z** redoes. Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V work as usual.
 - The app lives in the system tray. Right-click its icon to open or change the notes folder, toggle **Start with Windows**, or exit. Double-click the icon to open the notes folder.
 
 ## Settings

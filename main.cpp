@@ -13,6 +13,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <wchar.h>
+#include <wctype.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -32,6 +33,7 @@ const UINT WM_TRAY = WM_APP + 1;
 const int kHotkeyId = 1;
 const int kIconId = 1;  // see quicknote.rc
 const int kMaxNoteLength = 4000;
+const int kHistoryDepth = 100;
 enum MenuId : UINT { IDM_OPEN = 1, IDM_CHANGE, IDM_STARTUP, IDM_EXIT };
 
 // Popup size and font, in 96-DPI pixels; scaled to the monitor's DPI when shown.
@@ -59,6 +61,19 @@ HBRUSH g_backBrush;
 HICON g_icon;
 UINT g_taskbarCreated;
 bool g_hiding;
+
+// Undo history: the standard edit control only has a single undo step.
+struct History {
+    wchar_t* items[kHistoryDepth];
+    int count;
+};
+History g_undo, g_redo;
+wchar_t* g_currentText;  // the box's text as of the last change
+bool g_restoringText;    // text is being set by the app, not edited by the user
+bool g_typing;           // the change being processed is a typed character
+wchar_t g_typedChar;
+bool g_lastChangeTyped;
+wchar_t g_lastTypedChar;
 
 // ---- Settings (%AppData%\QuickNote\settings.ini) ----
 
@@ -289,13 +304,140 @@ DWORD AppendNote(const wchar_t* text) {
     return error;
 }
 
+// ---- Note box editing: undo history and word deletion ----
+
+wchar_t* CopyText(const wchar_t* text) {
+    size_t bytes = (wcslen(text) + 1) * sizeof(wchar_t);
+    wchar_t* copy = static_cast<wchar_t*>(HeapAlloc(GetProcessHeap(), 0, bytes));
+    memcpy(copy, text, bytes);
+    return copy;
+}
+
+void FreeText(wchar_t* text) {
+    if (text)
+        HeapFree(GetProcessHeap(), 0, text);
+}
+
+wchar_t* GetBoxText() {
+    int length = GetWindowTextLengthW(g_edit);
+    wchar_t* text = static_cast<wchar_t*>(HeapAlloc(GetProcessHeap(), 0, (length + 1) * sizeof(wchar_t)));
+    GetWindowTextW(g_edit, text, length + 1);
+    return text;
+}
+
+void PushHistory(History* history, wchar_t* text) {
+    if (history->count == kHistoryDepth) {  // drop the oldest step
+        FreeText(history->items[0]);
+        memmove(history->items, history->items + 1, (kHistoryDepth - 1) * sizeof(wchar_t*));
+        --history->count;
+    }
+    history->items[history->count++] = text;
+}
+
+wchar_t* PopHistory(History* history) {
+    return history->count ? history->items[--history->count] : nullptr;
+}
+
+void ClearHistory(History* history) {
+    while (history->count)
+        FreeText(history->items[--history->count]);
+}
+
+void ResetHistory() {
+    ClearHistory(&g_undo);
+    ClearHistory(&g_redo);
+    FreeText(g_currentText);
+    g_currentText = CopyText(L"");
+    g_lastChangeTyped = false;
+}
+
+// Called whenever the box's text changes. Typing is grouped into word-sized undo steps:
+// a new step starts at the first letter typed after a space, or after any non-typing edit.
+void RecordChange() {
+    if (g_restoringText)
+        return;
+    bool continuesWord = g_typing && g_lastChangeTyped && !(iswspace(g_lastTypedChar) && !iswspace(g_typedChar));
+    if (continuesWord)
+        FreeText(g_currentText);
+    else
+        PushHistory(&g_undo, g_currentText);
+    g_currentText = GetBoxText();
+    ClearHistory(&g_redo);
+    g_lastChangeTyped = g_typing;
+    if (g_typing)
+        g_lastTypedChar = g_typedChar;
+}
+
+// Shows a text from the history, with the caret where it differs from `previous`.
+void RestoreText(wchar_t* text, const wchar_t* previous) {
+    g_restoringText = true;
+    SetWindowTextW(g_edit, text);
+    g_restoringText = false;
+    size_t length = wcslen(text), previousLength = wcslen(previous), sameEnding = 0;
+    while (sameEnding < length && sameEnding < previousLength &&
+           text[length - 1 - sameEnding] == previous[previousLength - 1 - sameEnding])
+        ++sameEnding;
+    SendMessageW(g_edit, EM_SETSEL, length - sameEnding, length - sameEnding);
+    g_currentText = text;
+    g_lastChangeTyped = false;
+}
+
+void Undo() {
+    if (wchar_t* text = PopHistory(&g_undo)) {
+        PushHistory(&g_redo, g_currentText);
+        RestoreText(text, g_redo.items[g_redo.count - 1]);
+    }
+}
+
+void Redo() {
+    if (wchar_t* text = PopHistory(&g_redo)) {
+        PushHistory(&g_undo, g_currentText);
+        RestoreText(text, g_undo.items[g_undo.count - 1]);
+    }
+}
+
+bool IsWordChar(wchar_t c) {
+    return iswalnum(c) || c == L'_';
+}
+
+// Ctrl+Backspace / Ctrl+Delete: deletes to the previous / next word boundary, like most editors.
+void DeleteWord(bool forward) {
+    DWORD start = 0, end = 0;
+    SendMessageW(g_edit, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+    if (start == end) {
+        wchar_t* text = GetBoxText();
+        DWORD length = static_cast<DWORD>(wcslen(text));
+        if (forward) {
+            // The rest of this word (or run of punctuation), then the spaces after it.
+            if (end < length && IsWordChar(text[end]))
+                while (end < length && IsWordChar(text[end])) ++end;
+            else
+                while (end < length && !IsWordChar(text[end]) && !iswspace(text[end])) ++end;
+            while (end < length && iswspace(text[end])) ++end;
+        } else {
+            // The spaces before the caret, then the word (or run of punctuation) before them.
+            while (start > 0 && iswspace(text[start - 1])) --start;
+            if (start > 0 && IsWordChar(text[start - 1]))
+                while (start > 0 && IsWordChar(text[start - 1])) --start;
+            else
+                while (start > 0 && !IsWordChar(text[start - 1]) && !iswspace(text[start - 1])) --start;
+        }
+        FreeText(text);
+        SendMessageW(g_edit, EM_SETSEL, start, end);
+    }
+    SendMessageW(g_edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
+}
+
 // ---- Popup ----
 
 void HidePopup() {
     if (g_hiding || !IsWindowVisible(g_popup))
         return;
     g_hiding = true;
+    g_restoringText = true;
     SetWindowTextW(g_edit, L"");
+    g_restoringText = false;
+    ResetHistory();
     ShowWindow(g_popup, SW_HIDE);
     g_hiding = false;
 }
@@ -328,6 +470,31 @@ void SubmitNote() {
         }
     }
     HidePopup();
+}
+
+// Keyboard handling for the note box that the standard edit control lacks.
+// Returns true if the message was handled and shouldn't reach the control.
+bool HandleBoxMessage(const MSG& msg) {
+    if (msg.message == WM_CHAR) {
+        g_typing = msg.wParam >= L' ';  // cleared again after the character is dispatched
+        g_typedChar = static_cast<wchar_t>(msg.wParam);
+        return false;
+    }
+    if (msg.message != WM_KEYDOWN)
+        return false;
+
+    bool ctrl = GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0;  // not AltGr
+    bool shift = GetKeyState(VK_SHIFT) < 0;
+    switch (msg.wParam) {
+    case VK_RETURN: SubmitNote(); return true;
+    case VK_ESCAPE: HidePopup(); return true;
+    case VK_BACK: if (ctrl) { DeleteWord(false); return true; } break;
+    case VK_DELETE: if (ctrl && !shift) { DeleteWord(true); return true; } break;
+    case 'A': if (ctrl) { SendMessageW(g_edit, EM_SETSEL, 0, -1); return true; } break;
+    case 'Z': if (ctrl) { shift ? Redo() : Undo(); return true; } break;
+    case 'Y': if (ctrl) { Redo(); return true; } break;
+    }
+    return false;
 }
 
 // Windows may refuse to let a background app take focus. Attaching to the
@@ -391,6 +558,10 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_SETFOCUS:
         SetFocus(g_edit);
+        return 0;
+    case WM_COMMAND:
+        if (HIWORD(wParam) == EN_CHANGE)
+            RecordChange();
         return 0;
     case WM_CTLCOLOREDIT:
         SetTextColor(reinterpret_cast<HDC>(wParam), kTextColor);
@@ -493,22 +664,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         ShowError(message);
     }
 
+    ResetHistory();
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.hwnd == g_edit) {
-            if (msg.message == WM_KEYDOWN) {
-                if (msg.wParam == VK_RETURN) { SubmitNote(); continue; }
-                if (msg.wParam == VK_ESCAPE) { HidePopup(); continue; }
-                if (msg.wParam == 'A' && GetKeyState(VK_CONTROL) < 0) {
-                    SendMessageW(g_edit, EM_SETSEL, 0, -1);
-                    continue;
-                }
-            }
-            if (msg.message == WM_CHAR && msg.wParam == 0x7F)
-                continue;  // Ctrl+Backspace would otherwise insert a box character
-        }
+        if (msg.hwnd == g_edit && HandleBoxMessage(msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+        g_typing = false;
     }
 
     UnregisterHotKey(g_messageWnd, kHotkeyId);
