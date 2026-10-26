@@ -42,6 +42,12 @@ const int kPopupWidth = 520, kPopupHeight = 48, kPadding = 14, kFontSize = 16;
 const COLORREF kBackColor = RGB(0x20, 0x21, 0x24);
 const COLORREF kTextColor = RGB(0xE8, 0xEA, 0xED);
 const COLORREF kBorderColor = RGB(0x3C, 0x40, 0x43);
+const COLORREF kMutedColor = RGB(0x9A, 0xA0, 0xA6);
+
+// Recent notes above the box: row height and gap in 96-DPI pixels, and each row's opacity, newest first.
+const int kRecentCount = 3;
+const int kRecentHeight = 34, kRecentGap = 6;
+const BYTE kRecentAlpha[kRecentCount] = {210, 140, 75};
 
 // Windows 11 DWM attributes, spelled out so older SDKs still build.
 const DWORD kDwmCornerPreference = 33, kDwmBorderColor = 34;
@@ -77,6 +83,15 @@ Mode g_mode = Mode::Note;
 Hotkey g_pendingNoteHotkey;
 wchar_t* g_noteBeforeRecording;  // restored if shortcut recording is cancelled
 bool g_showingProblem;           // a rejected shortcut's message stays up until the next key press
+
+// The last few notes, shown above the box, newest (and most opaque) first.
+struct RecentNote {
+    wchar_t text[kMaxNoteLength + 1];
+    wchar_t when[32];  // "14:32" for today's notes, otherwise the date
+};
+RecentNote g_recent[kRecentCount];
+int g_recentCount;
+HWND g_recentWnd[kRecentCount];
 
 // Undo history: the standard edit control only has a single undo step.
 struct History {
@@ -439,6 +454,111 @@ DWORD AppendNote(const wchar_t* text) {
     return error;
 }
 
+// True for "YYYY-MM-DD.txt".
+bool IsNoteFileName(const wchar_t* name) {
+    if (wcslen(name) != 14 || _wcsicmp(name + 10, L".txt"))
+        return false;
+    for (int i = 0; i < 10; ++i)
+        if (i == 4 || i == 7 ? name[i] != L'-' : !iswdigit(name[i]))
+            return false;
+    return true;
+}
+
+// Replaces `name` with the newest note file that sorts before it. Dates sort by name.
+bool PreviousNoteFile(wchar_t* name) {
+    wchar_t before[15];
+    wcscpy_s(before, name);
+    wchar_t pattern[MAX_PATH + 16];
+    swprintf_s(pattern, L"%ls\\*.txt", g_settings.notesFolder);
+    WIN32_FIND_DATAW found;
+    HANDLE find = FindFirstFileW(pattern, &found);
+    if (find == INVALID_HANDLE_VALUE)
+        return false;
+    name[0] = 0;
+    do {
+        if (IsNoteFileName(found.cFileName) && _wcsicmp(found.cFileName, before) < 0 &&
+            _wcsicmp(found.cFileName, name) > 0)
+            wcscpy_s(name, 15, found.cFileName);
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return name[0] != 0;
+}
+
+// Adds the last notes of one day's file to g_recent, newest first, until it's full.
+void ReadRecentNotes(const wchar_t* fileName, bool today) {
+    wchar_t path[MAX_PATH + 16];
+    swprintf_s(path, L"%ls\\%ls", g_settings.notesFolder, fileName);
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+    // The tail is enough for the last few notes: each line is at most kMaxNoteLength characters.
+    static char utf8[kRecentCount * (kMaxNoteLength * 3 + 32)];
+    static wchar_t text[ARRAYSIZE(utf8) + 1];
+    LARGE_INTEGER size = {};
+    GetFileSizeEx(file, &size);
+    LARGE_INTEGER start;
+    start.QuadPart = size.QuadPart > static_cast<LONGLONG>(sizeof utf8) ? size.QuadPart - sizeof utf8 : 0;
+    SetFilePointerEx(file, start, nullptr, FILE_BEGIN);
+    DWORD bytes = 0;
+    ReadFile(file, utf8, sizeof utf8, &bytes, nullptr);
+    CloseHandle(file);
+    int length = MultiByteToWideChar(CP_UTF8, 0, utf8, bytes, text, ARRAYSIZE(text) - 1);
+    text[length] = 0;
+
+    // Older days show their date instead of the time.
+    wchar_t date[32] = L"";
+    if (!today) {
+        SYSTEMTIME day = {};
+        day.wYear = static_cast<WORD>(_wtoi(fileName));
+        day.wMonth = static_cast<WORD>(_wtoi(fileName + 5));
+        day.wDay = static_cast<WORD>(_wtoi(fileName + 8));
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &day, L"MMM d", date, ARRAYSIZE(date), nullptr);
+    }
+
+    // Walk the lines from the end. If the read started mid-file, the first line may be cut off, so skip it.
+    wchar_t* first = text;
+    if (start.QuadPart > 0)
+        while (*first && *first != L'\n')
+            ++first;
+    wchar_t* end = text + length;
+    while (end > first && g_recentCount < kRecentCount) {
+        wchar_t* line = end;
+        while (line > first && line[-1] != L'\n')
+            --line;
+        wchar_t* next = line > first ? line - 1 : first;
+        while (end > line && (end[-1] == L'\r' || end[-1] == L'\n' || end[-1] == L' '))
+            --end;
+        *end = 0;
+        if (*line) {
+            RecentNote& note = g_recent[g_recentCount++];
+            // Lines look like "[HH:MM:SS] text"; anything else is shown whole.
+            bool stamped = end - line > 11 && line[0] == L'[' && line[9] == L']' && line[10] == L' ';
+            wcsncpy_s(note.text, stamped ? line + 11 : line, _TRUNCATE);
+            if (!today)
+                wcscpy_s(note.when, date);
+            else if (stamped)
+                swprintf_s(note.when, L"%.5ls", line + 1);
+            else
+                note.when[0] = 0;
+        }
+        end = next;
+    }
+}
+
+// Loads the last few notes, newest first, looking back through earlier days if today has fewer.
+void LoadRecentNotes() {
+    g_recentCount = 0;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t today[16];
+    swprintf_s(today, L"%04u-%02u-%02u.txt", t.wYear, t.wMonth, t.wDay);
+    wchar_t name[15] = L"A";  // sorts after every date
+    // A few files at most, in case some are empty.
+    for (int files = 0; files < 5 && g_recentCount < kRecentCount && PreviousNoteFile(name); ++files)
+        ReadRecentNotes(name, !_wcsicmp(name, today));
+}
+
 // ---- Note box editing: undo history and word deletion ----
 
 wchar_t* CopyText(const wchar_t* text) {
@@ -719,6 +839,8 @@ void HidePopup() {
         StopShortcutRecording();
     SetBoxText(L"");
     ResetHistory();
+    for (HWND row : g_recentWnd)
+        ShowWindow(row, SW_HIDE);
     ShowWindow(g_popup, SW_HIDE);
     g_hiding = false;
 }
@@ -834,6 +956,19 @@ void ShowPopup() {
 
     SetWindowPos(g_popup, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
     SetWindowPos(g_edit, nullptr, padding, (height - lineHeight) / 2, width - 2 * padding, lineHeight, SWP_NOZORDER);
+
+    // The last notes stack upwards from the box, fading out the older they are.
+    LoadRecentNotes();
+    int rowHeight = MulDiv(kRecentHeight, dpi, 96), gap = MulDiv(kRecentGap, dpi, 96);
+    for (int i = 0; i < kRecentCount; ++i) {
+        int rowY = y - (i + 1) * (rowHeight + gap);
+        if (i >= g_recentCount || rowY < work.top) {
+            ShowWindow(g_recentWnd[i], SW_HIDE);
+            continue;
+        }
+        InvalidateRect(g_recentWnd[i], nullptr, TRUE);
+        SetWindowPos(g_recentWnd[i], HWND_TOPMOST, x, rowY, width, rowHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
     ShowWindow(g_popup, SW_SHOW);
     ForceForeground(g_popup);
     SetFocus(g_edit);
@@ -866,6 +1001,42 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DPICHANGED:  // ShowPopup already sizes for the target monitor
         return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// One recent note above the box: the text on the left, its time or date on the right.
+LRESULT CALLBACK RecentProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        int i = static_cast<int>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (i < g_recentCount) {
+            const RecentNote& note = g_recent[i];
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            int padding = MulDiv(kPadding, g_fontDpi, 96);
+            InflateRect(&rect, -padding, 0);
+            HGDIOBJ oldFont = SelectObject(dc, g_font);
+            SetBkMode(dc, TRANSPARENT);
+            const UINT flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+            RECT when = rect;
+            DrawTextW(dc, note.when, -1, &when, flags | DT_CALCRECT);
+            int whenWidth = when.right - when.left;
+            when = rect;
+            SetTextColor(dc, kMutedColor);
+            DrawTextW(dc, note.when, -1, &when, flags | DT_RIGHT);
+            rect.right -= whenWidth ? whenWidth + padding : 0;
+            SetTextColor(dc, kTextColor);
+            DrawTextW(dc, note.text, -1, &rect, flags | DT_END_ELLIPSIS);
+            SelectObject(dc, oldFont);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -924,6 +1095,26 @@ void CreateWindows(HINSTANCE instance) {
                              0, 0, 0, 0, g_popup, nullptr, instance, nullptr);
     SendMessageW(g_edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(kPlaceholder));
     SendMessageW(g_edit, EM_SETLIMITTEXT, kMaxNoteLength, 0);
+
+    WNDCLASSEXW recentClass = {sizeof recentClass};
+    recentClass.lpfnWndProc = RecentProc;
+    recentClass.hInstance = instance;
+    recentClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    recentClass.hbrBackground = g_backBrush;
+    recentClass.lpszClassName = L"QuickNoteRecent";
+    RegisterClassExW(&recentClass);
+
+    // Layered for the fade, click-through, and never activated, so the box keeps the focus.
+    for (int i = 0; i < kRecentCount; ++i) {
+        HWND row = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                                   recentClass.lpszClassName, kAppName, WS_POPUP, 0, 0, 0, 0, g_popup, nullptr,
+                                   instance, nullptr);
+        SetWindowLongPtrW(row, GWLP_USERDATA, i);
+        SetLayeredWindowAttributes(row, 0, kRecentAlpha[i], LWA_ALPHA);
+        DwmSetWindowAttribute(row, kDwmCornerPreference, &kDwmCornerRound, sizeof kDwmCornerRound);
+        DwmSetWindowAttribute(row, kDwmBorderColor, &kBorderColor, sizeof kBorderColor);
+        g_recentWnd[i] = row;
+    }
 }
 
 }  // namespace

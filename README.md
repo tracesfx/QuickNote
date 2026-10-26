@@ -2,6 +2,7 @@
 
 Press **Ctrl+Space** anywhere, type a note, press **Enter**. The note is added to a plain-text file for the day, and the box disappears. QuickNote is a single small exe for Windows 10/11 with nothing to install.
 
+- Your last three notes appear above the box, fading out the older they are, with their time (or date, for earlier days).
 - **Esc**, or clicking away, cancels.
 - **Ctrl+Shift+Space** anywhere opens the notes folder.
 - Notes go to `Documents\QuickNotes\YYYY-MM-DD.txt` by default, one line per note: `[14:32:07] check the glow on shot 12`
