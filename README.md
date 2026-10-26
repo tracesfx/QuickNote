@@ -10,6 +10,9 @@ Press **Ctrl+Space** anywhere, type a note, press **Enter**. The note is added t
 - In the box, **Ctrl+Backspace / Ctrl+Delete** delete a word at a time. **Ctrl+Z** undoes (a word at a time), and **Ctrl+Y** or **Ctrl+Shift+Z** redoes. Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V work as usual.
 - The app lives in the system tray. Right-click its icon to open or change the notes folder, change shortcuts, toggle **Start with Windows**, or exit. Double-click the icon to open the notes folder.
 
+## Moving and resizing the bar
+Drag the bar by its margin (the pointer becomes a four-way arrow) to move it. It snaps to the middle of the screen. Drag its edges to resize it: a taller bar has larger text. QuickNote remembers the position and size, and puts the bar in the same place on whichever monitor you're using. If the bar is near the top of the screen, your recent notes appear below it instead of above. To go back to the default, right-click the tray icon and choose **Reset bar size and position**.
+
 ## Changing shortcuts
 Press **Ctrl+K** in the note box, or choose **Change shortcuts…** from the tray menu. Press the new-note shortcut, then the open-folder shortcut. Press Enter at either step to keep the current one, or Esc to cancel. QuickNote rejects combinations that another app already uses, that would override everyday shortcuts (Ctrl+C, Alt+F4, …), or that have no Ctrl, Alt or Win key.
 
@@ -22,7 +25,12 @@ NotesFolder=C:\Users\you\Documents\QuickNotes
 Hotkey=Ctrl+Space
 FolderHotkey=Ctrl+Shift+Space
 StartWithWindows=0
+BarPosition=50.0,25.0
+BarWidth=520
+BarHeight=48
 ```
+
+`BarPosition` is the bar's centre and top edge, as percentages of the screen's usable area. `BarWidth` and `BarHeight` are in pixels at 100% display scaling (height 36–96).
 
 Shortcuts are easiest to change with Ctrl+K. If you edit the file by hand, restart QuickNote afterwards.
 

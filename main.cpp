@@ -12,8 +12,10 @@
 #include <shellscalingapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <stdlib.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <windowsx.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -35,10 +37,16 @@ const int kIconId = 1;  // see quicknote.rc
 const UINT_PTR kSavedTimerId = 1;
 const int kMaxNoteLength = 4000;
 const int kHistoryDepth = 100;
-enum MenuId : UINT { IDM_OPEN = 1, IDM_CHANGE, IDM_SHORTCUTS, IDM_STARTUP, IDM_EXIT };
+enum MenuId : UINT { IDM_OPEN = 1, IDM_CHANGE, IDM_SHORTCUTS, IDM_RESET_BAR, IDM_STARTUP, IDM_EXIT };
 
-// Popup size and font, in 96-DPI pixels; scaled to the monitor's DPI when shown.
+// Default popup size and its font, in 96-DPI pixels; scaled to the monitor's DPI when shown.
+// The text, padding and note rows scale with the bar's height.
 const int kPopupWidth = 520, kPopupHeight = 48, kPadding = 14, kFontSize = 16;
+const int kMinBarWidth = 280, kMinBarHeight = 36, kMaxBarHeight = 96;
+const int kResizeBorder = 6;  // edges of the bar that resize it; the rest of its margin moves it
+const int kSnapDistance = 12;  // the bar snaps to the horizontal centre when dragged this close
+// Default position, as percentages of the monitor's work area: the bar's centre, and its top.
+const double kDefaultBarX = 50, kDefaultBarY = 25;
 const COLORREF kBackColor = RGB(0x20, 0x21, 0x24);
 const COLORREF kTextColor = RGB(0xE8, 0xEA, 0xED);
 const COLORREF kBorderColor = RGB(0x3C, 0x40, 0x43);
@@ -53,7 +61,7 @@ const BYTE kRecentAlpha[kRecentCount] = {210, 140, 75};
 const UINT_PTR kAnimationTimerId = 1;  // on the message window
 const int kDrift = 8;                  // the box and notes settle downwards by this much when opening
 const double kOpenTime = 120, kRowDelay = 40, kRowStagger = 30;
-const double kCloseTime = 90;
+const double kCloseTime = 150;
 const double kSaveShiftTime = 160, kSaveHoldTime = 40, kSaveBoxFadeTime = 150;
 const double kHintFadeInTime = 200, kHintHoldTime = 3000, kHintFadeOutTime = 300;
 const BYTE kHintAlpha = 235;
@@ -76,6 +84,8 @@ struct Settings {
     Hotkey noteHotkey;
     Hotkey folderHotkey;
     bool startWithWindows;
+    double barX, barY;         // percent of the work area: the bar's centre, and its top
+    int barWidth, barHeight;   // 96-DPI pixels
 };
 
 // What the popup is doing: taking a note, or recording new shortcuts (Ctrl+K).
@@ -85,6 +95,7 @@ Settings g_settings;
 HWND g_messageWnd, g_popup, g_edit;
 HFONT g_font;
 UINT g_fontDpi;
+int g_fontHeight;
 HBRUSH g_backBrush;
 HICON g_icon;
 UINT g_taskbarCreated;
@@ -104,11 +115,16 @@ RecentNote g_recent[kRecentCount + 1];
 int g_recentCount;
 HWND g_recentWnd[kRecentCount + 1];
 
-// Where ShowPopup placed the box and the note rows above it.
+// Where ShowPopup placed the box and the note rows next to it.
 struct Layout {
-    int x, y, width, rowHeight, gap, top;
+    int x, y, width, height, rowHeight, gap;
+    RECT work;
+    bool below;  // no room above the box, so the notes stack downwards
 };
 Layout g_layout;
+bool g_adjusting;  // the bar is being dragged or resized
+POINT g_dragStartCursor;
+RECT g_dragStartRect;
 
 // Hidden -> Shown (taking input) -> Closing (fading out, focus already handed back) -> Hidden.
 enum class PopupState { Hidden, Shown, Closing };
@@ -240,6 +256,24 @@ void SaveSettings() {
     FormatHotkey(s.folderHotkey, hotkey, ARRAYSIZE(hotkey));
     WritePrivateProfileStringW(kAppName, L"FolderHotkey", hotkey, s.file);
     WritePrivateProfileStringW(kAppName, L"StartWithWindows", s.startWithWindows ? L"1" : L"0", s.file);
+    wchar_t value[64];
+    swprintf_s(value, L"%.1f,%.1f", s.barX, s.barY);
+    WritePrivateProfileStringW(kAppName, L"BarPosition", value, s.file);
+    swprintf_s(value, L"%d", s.barWidth);
+    WritePrivateProfileStringW(kAppName, L"BarWidth", value, s.file);
+    swprintf_s(value, L"%d", s.barHeight);
+    WritePrivateProfileStringW(kAppName, L"BarHeight", value, s.file);
+}
+
+int Clamp(int value, int low, int high) {
+    return value < low ? low : value > high ? high : value;
+}
+
+void ResetBar() {
+    g_settings.barX = kDefaultBarX;
+    g_settings.barY = kDefaultBarY;
+    g_settings.barWidth = kPopupWidth;
+    g_settings.barHeight = kPopupHeight;
 }
 
 // A new settings file starts with a UTF-16 BOM so Windows writes the INI as Unicode, not ANSI.
@@ -283,7 +317,17 @@ void LoadSettings() {
     if (!ParseHotkey(hotkey, &s.folderHotkey))
         s.folderHotkey = kDefaultFolderHotkey;
     s.startWithWindows = GetPrivateProfileIntW(kAppName, L"StartWithWindows", 0, s.file) != 0;
-    // Also fills in keys added since the file was written (FolderHotkey).
+    ResetBar();
+    wchar_t position[64];
+    GetPrivateProfileStringW(kAppName, L"BarPosition", L"", position, ARRAYSIZE(position), s.file);
+    double x, y;
+    if (swscanf_s(position, L"%lf,%lf", &x, &y) == 2 && x >= 0 && x <= 100 && y >= 0 && y <= 100) {
+        s.barX = x;
+        s.barY = y;
+    }
+    s.barWidth = Clamp(GetPrivateProfileIntW(kAppName, L"BarWidth", kPopupWidth, s.file), kMinBarWidth, 4000);
+    s.barHeight = Clamp(GetPrivateProfileIntW(kAppName, L"BarHeight", kPopupHeight, s.file), kMinBarHeight, kMaxBarHeight);
+    // Also fills in keys added since the file was written (FolderHotkey, the bar's position and size).
     SaveSettings();
 }
 
@@ -435,6 +479,7 @@ void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, IDM_OPEN, L"Open notes folder");
     AppendMenuW(menu, MF_STRING, IDM_CHANGE, L"Change notes folder…");
     AppendMenuW(menu, MF_STRING, IDM_SHORTCUTS, L"Change shortcuts…");
+    AppendMenuW(menu, MF_STRING, IDM_RESET_BAR, L"Reset bar size and position");
     AppendMenuW(menu, MF_STRING | (g_settings.startWithWindows ? MF_CHECKED : 0), IDM_STARTUP, L"Start with Windows");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
@@ -454,6 +499,10 @@ void ShowTrayMenu() {
     case IDM_SHORTCUTS:
         ShowPopup();
         StartShortcutRecording();
+        break;
+    case IDM_RESET_BAR:
+        ResetBar();
+        SaveSettings();
         break;
     case IDM_STARTUP: ToggleStartWithWindows(); break;
     case IDM_EXIT: PostQuitMessage(0); break;
@@ -888,7 +937,10 @@ double NowMs() {
 void ApplyTrack(Track& t, double now) {
     double p = t.duration > 0 ? (now - t.start) / t.duration : 1;
     p = p < 0 ? 0 : p > 1 ? 1 : p;
-    double eased = 1 - (1 - p) * (1 - p) * (1 - p);  // ease-out cubic: quick start, gentle landing
+    // Movement and fading in ease out: quick start, gentle landing. A plain fade-out eases in and out
+    // instead, so faint windows (the older notes) fade visibly rather than vanishing in the first frames.
+    bool fadeOut = t.fromY == t.toY && t.toAlpha < t.fromAlpha;
+    double eased = fadeOut ? p * p * (3 - 2 * p) : 1 - (1 - p) * (1 - p) * (1 - p);
     int alpha = t.fromAlpha + static_cast<int>((t.toAlpha - t.fromAlpha) * eased);
     if (alpha != t.alpha) {
         SetLayeredWindowAttributes(t.hwnd, 0, static_cast<BYTE>(alpha), LWA_ALPHA);
@@ -946,8 +998,30 @@ void OnAnimationFrame() {
 
 // ---- Popup ----
 
-int RowY(int slot) {  // slot -1 is the box itself
-    return g_layout.y - (slot + 1) * (g_layout.rowHeight + g_layout.gap);
+// Top of the note row in a slot, counted outwards from the box. Slot -1 is the middle of the box itself.
+int RowY(int slot) {
+    const Layout& l = g_layout;
+    if (slot < 0)
+        return l.y + (l.height - l.rowHeight) / 2;
+    int step = l.rowHeight + l.gap;
+    return l.below ? l.y + l.height + l.gap + slot * step : l.y - (slot + 1) * step;
+}
+
+bool RowFits(int slot) {
+    int y = RowY(slot);
+    return y >= g_layout.work.top && y + g_layout.rowHeight <= g_layout.work.bottom;
+}
+
+// Padding inside the bar and the note rows, which grows with the bar's height.
+int BarPadding() {
+    return MulDiv(kPadding, g_layout.height, kPopupHeight);  // the height is already scaled for the DPI
+}
+
+// The notes go above the box, or below it when the box is too close to the top of the screen.
+void ChooseRowDirection() {
+    Layout& l = g_layout;
+    int needed = (g_recentCount < kRecentCount ? g_recentCount : kRecentCount) * (l.rowHeight + l.gap);
+    l.below = l.y - needed < l.work.top && l.y + l.height + needed <= l.work.bottom;
 }
 
 void SetClickThrough(HWND hwnd, bool clickThrough) {
@@ -995,12 +1069,12 @@ void HidePopup(bool saved) {
     for (int i = 0; i < kRecentCount; ++i) {
         if (!IsWindowVisible(g_recentWnd[i]))
             continue;
-        bool staysInStack = i + 1 < kRecentCount && RowY(i + 1) >= l.top;
+        bool staysInStack = i + 1 < kRecentCount && RowFits(i + 1);
         Animate(kFirstRowTrack + i, g_recentWnd[i], l.x, g_tracks[kFirstRowTrack + i].alpha,
                 staysInStack ? kRecentAlpha[i + 1] : 0, RowY(i), RowY(i + 1), kSaveShiftTime, 0,
                 staysInStack ? Then::FadeOut : Then::Hide, kSaveHoldTime, kCloseTime);
     }
-    if (RowY(0) >= l.top) {
+    if (RowFits(0)) {
         HWND row = g_recentWnd[kSavedRow];
         InvalidateRect(row, nullptr, TRUE);
         Animate(kFirstRowTrack + kSavedRow, row, l.x, 0, kRecentAlpha[0], RowY(-1), RowY(0), kSaveShiftTime, 0,
@@ -1099,6 +1173,21 @@ void ForceForeground(HWND hwnd) {
     }
 }
 
+// Makes the font match the DPI and the bar's height (the text grows with the bar).
+void UseFont(UINT dpi) {
+    int height = MulDiv(MulDiv(kFontSize, g_settings.barHeight, kPopupHeight), dpi, 96);
+    if (g_font && dpi == g_fontDpi && height == g_fontHeight)
+        return;
+    if (g_font)
+        DeleteObject(g_font);
+    g_font = CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    g_fontDpi = dpi;
+    g_fontHeight = height;
+    SendMessageW(g_edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
+}
+
 // The work area and DPI of the monitor the cursor is on. Also sizes the font for that DPI.
 UINT CursorMonitor(RECT* work) {
     POINT pt;
@@ -1109,17 +1198,61 @@ UINT CursorMonitor(RECT* work) {
     *work = info.rcWork;
     UINT dpi = 96, dpiY = 96;
     GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &dpiY);
-
-    if (dpi != g_fontDpi) {
-        if (g_font)
-            DeleteObject(g_font);
-        g_font = CreateFontW(-MulDiv(kFontSize, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        g_fontDpi = dpi;
-        SendMessageW(g_edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), FALSE);
-        SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
-    }
+    UseFont(dpi);
     return dpi;
+}
+
+// Where the bar goes on a work area: its saved position, kept fully on screen.
+POINT BarPosition(const RECT& work, int width, int height) {
+    POINT pt;
+    pt.x = work.left + static_cast<int>((work.right - work.left) * g_settings.barX / 100) - width / 2;
+    pt.y = work.top + static_cast<int>((work.bottom - work.top) * g_settings.barY / 100);
+    pt.x = Clamp(pt.x, work.left, work.right - width);
+    pt.y = Clamp(pt.y, work.top, work.bottom - height);
+    return pt;
+}
+
+// Centres the text line vertically in the box.
+void LayoutBox(int width, int height) {
+    HDC dc = GetDC(g_edit);
+    HGDIOBJ oldFont = SelectObject(dc, g_font);
+    TEXTMETRICW metrics;
+    GetTextMetricsW(dc, &metrics);
+    SelectObject(dc, oldFont);
+    ReleaseDC(g_edit, dc);
+    int padding = BarPadding(), lineHeight = metrics.tmHeight + 2;
+    SetWindowPos(g_edit, nullptr, padding, (height - lineHeight) / 2, width - 2 * padding, lineHeight, SWP_NOZORDER);
+}
+
+// Keeps the note rows next to the box while it's dragged or resized.
+void PlaceRows() {
+    ChooseRowDirection();
+    for (int i = 0; i < kRecentCount; ++i) {
+        HWND row = g_recentWnd[i];
+        if (i >= g_recentCount || !RowFits(i)) {
+            ShowWindow(row, SW_HIDE);
+            continue;
+        }
+        SetWindowPos(row, HWND_TOPMOST, g_layout.x, RowY(i), g_layout.width, g_layout.rowHeight,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(row, nullptr, TRUE);
+    }
+}
+
+// Saves where the bar was dragged to, and its size, relative to the monitor it's on.
+void SaveBarPlacement() {
+    RECT r;
+    GetWindowRect(g_popup, &r);
+    MONITORINFO info = {sizeof info};
+    GetMonitorInfoW(MonitorFromWindow(g_popup, MONITOR_DEFAULTTONEAREST), &info);
+    const RECT& work = info.rcWork;
+    g_settings.barX = 100.0 * ((r.left + r.right) / 2 - work.left) / (work.right - work.left);
+    g_settings.barY = 100.0 * (r.top - work.top) / (work.bottom - work.top);
+    g_settings.barX = g_settings.barX < 0 ? 0 : g_settings.barX > 100 ? 100 : g_settings.barX;
+    g_settings.barY = g_settings.barY < 0 ? 0 : g_settings.barY > 100 ? 100 : g_settings.barY;
+    g_settings.barWidth = MulDiv(r.right - r.left, 96, g_fontDpi);
+    g_settings.barHeight = Clamp(MulDiv(r.bottom - r.top, 96, g_fontDpi), kMinBarHeight, kMaxBarHeight);
+    SaveSettings();
 }
 
 // Reads Windows' "Animation effects" setting (Settings > Accessibility > Visual effects).
@@ -1129,7 +1262,7 @@ void ReadAnimationSetting() {
     g_animate = animate != FALSE;
 }
 
-// Centers the box horizontally, a quarter of the way down the monitor the cursor is on.
+// Shows the box at its saved position and size on the monitor the cursor is on.
 // It fades in while settling into place, then the recent notes follow one after another.
 void ShowPopup() {
     if (g_popupState == PopupState::Closing)
@@ -1139,29 +1272,24 @@ void ShowPopup() {
     RECT work;
     UINT dpi = CursorMonitor(&work);
 
-    HDC dc = GetDC(g_edit);
-    HGDIOBJ oldFont = SelectObject(dc, g_font);
-    TEXTMETRICW metrics;
-    GetTextMetricsW(dc, &metrics);
-    SelectObject(dc, oldFont);
-    ReleaseDC(g_edit, dc);
-
-    int width = MulDiv(kPopupWidth, dpi, 96), height = MulDiv(kPopupHeight, dpi, 96);
-    int padding = MulDiv(kPadding, dpi, 96), lineHeight = metrics.tmHeight + 2;
+    int width = MulDiv(g_settings.barWidth, dpi, 96), height = MulDiv(g_settings.barHeight, dpi, 96);
+    width = width < work.right - work.left ? width : work.right - work.left;
+    POINT pt = BarPosition(work, width, height);
     int drift = MulDiv(kDrift, dpi, 96);
     Layout& l = g_layout;
-    l = {work.left + (work.right - work.left - width) / 2, work.top + (work.bottom - work.top) / 4, width,
-         MulDiv(kRecentHeight, dpi, 96), MulDiv(kRecentGap, dpi, 96), static_cast<int>(work.top)};
+    l = {pt.x, pt.y, width, height, MulDiv(MulDiv(kRecentHeight, g_settings.barHeight, kPopupHeight), dpi, 96),
+         MulDiv(kRecentGap, dpi, 96), work, false};
 
     // Starts transparent: the window is shown at once (so typing goes straight in) and fades in.
     Animate(kBoxTrack, g_popup, l.x, 0, 255, l.y - drift, l.y, kOpenTime);
     SetWindowPos(g_popup, HWND_TOPMOST, l.x, l.y - drift, width, height, SWP_NOACTIVATE);
-    SetWindowPos(g_edit, nullptr, padding, (height - lineHeight) / 2, width - 2 * padding, lineHeight, SWP_NOZORDER);
+    LayoutBox(width, height);
 
-    // The last notes stack upwards from the box, fading out the older they are.
+    // The last notes stack outwards from the box, fading out the older they are.
     LoadRecentNotes();
+    ChooseRowDirection();
     for (int i = 0; i < kRecentCount; ++i) {
-        if (i >= g_recentCount || RowY(i) < l.top)
+        if (i >= g_recentCount || !RowFits(i))
             continue;
         HWND row = g_recentWnd[i];
         InvalidateRect(row, nullptr, TRUE);
@@ -1197,10 +1325,14 @@ void ShowHint() {
     SelectObject(dc, oldFont);
     ReleaseDC(g_hint, dc);
 
+    // Centred where the bar appears.
     int padding = MulDiv(kPadding, dpi, 96), drift = MulDiv(kDrift, dpi, 96);
-    int width = padding + iconSize + padding * 2 / 3 + text.cx + padding, height = MulDiv(kHintHeight, dpi, 96);
-    int x = work.left + (work.right - work.left - width) / 2;
-    int y = work.top + (work.bottom - work.top) / 4 + (MulDiv(kPopupHeight, dpi, 96) - height) / 2;
+    int width = padding + iconSize + padding * 2 / 3 + text.cx + padding;
+    int height = MulDiv(MulDiv(kHintHeight, g_settings.barHeight, kPopupHeight), dpi, 96);
+    int barWidth = MulDiv(g_settings.barWidth, dpi, 96), barHeight = MulDiv(g_settings.barHeight, dpi, 96);
+    POINT bar = BarPosition(work, barWidth, barHeight);
+    int x = Clamp(bar.x + (barWidth - width) / 2, work.left, work.right - width);
+    int y = bar.y + (barHeight - height) / 2;
     Animate(kHintTrack, g_hint, x, 0, kHintAlpha, y - drift, y, kHintFadeInTime, 0, Then::FadeOut, kHintHoldTime,
             kHintFadeOutTime);
     SetWindowPos(g_hint, HWND_TOPMOST, x, y - drift, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -1258,6 +1390,95 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DPICHANGED:  // ShowPopup already sizes for the target monitor
         return 0;
+
+    // Dragging the margin around the text moves the bar; dragging its edges resizes it.
+    case WM_NCHITTEST: {
+        if (g_popupState != PopupState::Shown)
+            break;
+        POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        RECT r;
+        GetWindowRect(hwnd, &r);
+        int border = MulDiv(kResizeBorder, g_fontDpi, 96);
+        bool left = pt.x < r.left + border, right = pt.x >= r.right - border;
+        bool top = pt.y < r.top + border, bottom = pt.y >= r.bottom - border;
+        if (top)
+            return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
+        if (bottom)
+            return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
+        return left ? HTLEFT : right ? HTRIGHT : HTCAPTION;
+    }
+    case WM_NCLBUTTONDOWN:  // where a drag starts; Windows only reports it moving after the first step
+        g_dragStartCursor = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        break;
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCAPTION) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+            return TRUE;
+        }
+        break;
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        UINT dpi = g_fontDpi ? g_fontDpi : 96;
+        info->ptMinTrackSize = {MulDiv(kMinBarWidth, dpi, 96), MulDiv(kMinBarHeight, dpi, 96)};
+        info->ptMaxTrackSize.y = MulDiv(kMaxBarHeight, dpi, 96);
+        return 0;
+    }
+    case WM_ENTERSIZEMOVE:
+        // Finish the opening animation at once so it doesn't fight the drag.
+        g_adjusting = true;
+        GetWindowRect(hwnd, &g_dragStartRect);
+        for (int id = kBoxTrack; id < kHintTrack; ++id) {
+            Track& t = g_tracks[id];
+            if (t.active) {
+                t.active = false;
+                SetLayeredWindowAttributes(t.hwnd, 0, static_cast<BYTE>(t.toAlpha), LWA_ALPHA);
+                t.alpha = t.toAlpha;
+            }
+        }
+        return 0;
+    case WM_MOVING: {
+        // Follow the cursor from where the drag started (Windows moves on from the last, possibly
+        // snapped, position, which would keep the bar stuck at the centre), then snap to the centre.
+        auto* r = reinterpret_cast<RECT*>(lParam);
+        POINT cursor;
+        GetCursorPos(&cursor);
+        SetRect(r, g_dragStartRect.left, g_dragStartRect.top, g_dragStartRect.right, g_dragStartRect.bottom);
+        OffsetRect(r, cursor.x - g_dragStartCursor.x, cursor.y - g_dragStartCursor.y);
+        MONITORINFO info = {sizeof info};
+        GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &info);
+        int offset = (info.rcWork.left + info.rcWork.right) / 2 - (r->left + r->right) / 2;
+        if (offset != 0 && abs(offset) <= MulDiv(kSnapDistance, g_fontDpi, 96))
+            OffsetRect(r, offset, 0);
+        return TRUE;
+    }
+    case WM_MOVE:
+        if (g_adjusting) {
+            RECT r;
+            GetWindowRect(hwnd, &r);
+            g_layout.x = r.left;
+            g_layout.y = r.top;
+            PlaceRows();
+        }
+        return 0;
+    case WM_SIZE: {
+        int width = LOWORD(lParam), height = HIWORD(lParam);
+        if (g_adjusting) {
+            // The text and note rows grow with the bar's height.
+            g_settings.barHeight = Clamp(MulDiv(height, 96, g_fontDpi), kMinBarHeight, kMaxBarHeight);
+            UseFont(g_fontDpi);
+            g_layout.width = width;
+            g_layout.height = height;
+            g_layout.rowHeight = MulDiv(MulDiv(kRecentHeight, g_settings.barHeight, kPopupHeight), g_fontDpi, 96);
+            PlaceRows();
+        }
+        LayoutBox(width, height);
+        return 0;
+    }
+    case WM_EXITSIZEMOVE:
+        g_adjusting = false;
+        SaveBarPlacement();
+        SetFocus(g_edit);
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -1275,7 +1496,7 @@ LRESULT CALLBACK RecentProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const RecentNote& note = g_recent[i];
             RECT rect;
             GetClientRect(hwnd, &rect);
-            int padding = MulDiv(kPadding, g_fontDpi, 96);
+            int padding = BarPadding();
             InflateRect(&rect, -padding, 0);
             HGDIOBJ oldFont = SelectObject(dc, g_font);
             SetBkMode(dc, TRANSPARENT);
