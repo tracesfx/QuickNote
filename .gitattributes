@@ -1,0 +1,3 @@
+# Store and restore every file byte-for-byte: the embedded manifest is part of the exe,
+# and Smart App Control verdicts depend on the exact build output.
+* -text
