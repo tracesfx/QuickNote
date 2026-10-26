@@ -18,7 +18,7 @@ QuickNote is a single 60 KB exe for Windows 10 and 11. It needs no installer and
 
 ## Getting started
 
-1. Download `QuickNote.exe` (or [build it](#building)) and put it in any folder.
+1. Download `QuickNote.exe` from the [latest release](https://github.com/tracesfx/QuickNote/releases/latest) (or [build it](#building)) and put it in any folder.
 2. Run it. A hint shows which shortcut to press, and an icon appears in the system tray.
 3. Press **Ctrl+Space**, type, and press **Enter**.
 
@@ -83,3 +83,7 @@ QuickNote isn't code-signed, so Windows treats a downloaded copy with caution:
 - **Browser:** Chrome or Edge may say the file isn't commonly downloaded. Choose **Keep**.
 - **SmartScreen:** the first time you run it, Windows may show "Windows protected your PC". Click **More info → Run anyway**.
 - **Smart App Control:** on PCs where it's turned on, Windows may block QuickNote outright, and its verdict isn't predictable. A fresh build of the same source can be allowed on one build and blocked on the next. Once a particular exe has been allowed on a PC, that file keeps running there. PCs where Smart App Control is off or in evaluation mode run QuickNote normally.
+
+## License
+
+[MIT](LICENSE)
