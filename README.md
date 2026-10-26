@@ -2,7 +2,7 @@
 
 **Jot down a thought without leaving what you're doing.** Press **Ctrl+Space** anywhere in Windows, type a line, press **Enter**. The note is added to today's plain-text file and the box disappears.
 
-![QuickNote: the note box with the last three notes fading out above it](docs/screenshot.png)
+![QuickNote demo: press Ctrl+Space over any app, type a note, press Enter, and it is appended to today's plain-text file](docs/demo.gif)
 
 QuickNote is a single 60 KB exe for Windows 10 and 11. It needs no installer and no runtime, and uses about 2 MB of memory. It has no taskbar button or window of its own: it waits in the system tray until you press the shortcut.
 
