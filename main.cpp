@@ -30,6 +30,7 @@ const wchar_t kPlaceholder[] = L"Quick note…   Enter to save · Esc to cancel"
 const wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const UINT WM_TRAY = WM_APP + 1;
 const int kHotkeyId = 1;
+const int kIconId = 1;  // see quicknote.rc
 const int kMaxNoteLength = 4000;
 enum MenuId : UINT { IDM_OPEN = 1, IDM_CHANGE, IDM_STARTUP, IDM_EXIT };
 
@@ -172,35 +173,6 @@ void ShowError(const wchar_t* message) {
     wcsncpy_s(nid.szInfo, message, _TRUNCATE);
     nid.dwInfoFlags = NIIF_WARNING;
     Shell_NotifyIconW(NIM_MODIFY, &nid);
-}
-
-// Draws a 32x32 yellow sticky note with three ruled lines, so no .ico file is needed.
-HICON CreateNoteIcon() {
-    const int size = 32;
-    BITMAPINFO info = {};
-    info.bmiHeader.biSize = sizeof info.bmiHeader;
-    info.bmiHeader.biWidth = size;
-    info.bmiHeader.biHeight = -size;  // top-down rows
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP color = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    DWORD* pixels = static_cast<DWORD*>(bits);
-    for (int y = 0; y < size; ++y) {
-        for (int x = 0; x < size; ++x) {
-            bool onPaper = x >= 4 && x < 28 && y >= 2 && y < 30;
-            bool onLine = x >= 9 && x < 23 && (y == 10 || y == 11 || y == 16 || y == 17 || y == 22 || y == 23);
-            pixels[y * size + x] = !onPaper ? 0 : onLine ? 0xFF6E5000 : 0xFFFFCA28;  // ARGB
-        }
-    }
-    static const BYTE maskBits[size * size / 8] = {};
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, maskBits);
-    ICONINFO iconInfo = {TRUE, 0, 0, mask, color};
-    HICON icon = CreateIconIndirect(&iconInfo);
-    DeleteObject(color);
-    DeleteObject(mask);
-    return icon;
 }
 
 // ---- Tray menu actions ----
@@ -501,7 +473,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     LoadSettings();
     g_backBrush = CreateSolidBrush(kBackColor);
-    g_icon = CreateNoteIcon();
+    // Picks the icon size that matches the tray at the current display scaling.
+    LoadIconMetric(instance, MAKEINTRESOURCEW(kIconId), LIM_SMALL, &g_icon);
     CreateWindows(instance);
     AddTrayIcon();
 

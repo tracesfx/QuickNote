@@ -1,4 +1,4 @@
 #include <windows.h>
 
-// The app icon shown by Explorer.
+// The app icon shown by Explorer, also loaded by main.cpp (kIconId) for the tray.
 1 ICON "quicknote.ico"
