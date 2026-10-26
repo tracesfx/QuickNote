@@ -27,14 +27,15 @@
 namespace {
 
 const wchar_t kAppName[] = L"QuickNote";
-const wchar_t kPlaceholder[] = L"Quick note…   Enter to save · Esc to cancel";
+const wchar_t kPlaceholder[] = L"Quick note…   Enter to save · Esc to cancel · Ctrl+K shortcuts";
 const wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const UINT WM_TRAY = WM_APP + 1;
-const int kHotkeyId = 1;
+const int kNoteHotkeyId = 1, kFolderHotkeyId = 2, kTestHotkeyId = 3;
 const int kIconId = 1;  // see quicknote.rc
+const UINT_PTR kSavedTimerId = 1;
 const int kMaxNoteLength = 4000;
 const int kHistoryDepth = 100;
-enum MenuId : UINT { IDM_OPEN = 1, IDM_CHANGE, IDM_STARTUP, IDM_EXIT };
+enum MenuId : UINT { IDM_OPEN = 1, IDM_CHANGE, IDM_SHORTCUTS, IDM_STARTUP, IDM_EXIT };
 
 // Popup size and font, in 96-DPI pixels; scaled to the monitor's DPI when shown.
 const int kPopupWidth = 520, kPopupHeight = 48, kPadding = 14, kFontSize = 16;
@@ -46,12 +47,23 @@ const COLORREF kBorderColor = RGB(0x3C, 0x40, 0x43);
 const DWORD kDwmCornerPreference = 33, kDwmBorderColor = 34;
 const int kDwmCornerRound = 2;
 
+struct Hotkey {
+    UINT modifiers;  // MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN
+    UINT vk;
+};
+const Hotkey kDefaultNoteHotkey = {MOD_CONTROL, VK_SPACE};
+const Hotkey kDefaultFolderHotkey = {MOD_CONTROL | MOD_SHIFT, VK_SPACE};
+
 struct Settings {
     wchar_t file[MAX_PATH];
     wchar_t notesFolder[MAX_PATH];
-    wchar_t hotkey[64];
+    Hotkey noteHotkey;
+    Hotkey folderHotkey;
     bool startWithWindows;
 };
+
+// What the popup is doing: taking a note, or recording new shortcuts (Ctrl+K).
+enum class Mode { Note, RecordNoteHotkey, RecordFolderHotkey, Saved };
 
 Settings g_settings;
 HWND g_messageWnd, g_popup, g_edit;
@@ -61,6 +73,10 @@ HBRUSH g_backBrush;
 HICON g_icon;
 UINT g_taskbarCreated;
 bool g_hiding;
+Mode g_mode = Mode::Note;
+Hotkey g_pendingNoteHotkey;
+wchar_t* g_noteBeforeRecording;  // restored if shortcut recording is cancelled
+bool g_showingProblem;           // a rejected shortcut's message stays up until the next key press
 
 // Undo history: the standard edit control only has a single undo step.
 struct History {
@@ -75,12 +91,112 @@ wchar_t g_typedChar;
 bool g_lastChangeTyped;
 wchar_t g_lastTypedChar;
 
+// ---- Hotkey names ("Ctrl+Space", "Ctrl+Alt+N", ...) ----
+
+const struct { const wchar_t* name; UINT vk; } kKeyNames[] = {
+    {L"Space", VK_SPACE}, {L"Enter", VK_RETURN}, {L"Tab", VK_TAB}, {L"Insert", VK_INSERT},
+    {L"Delete", VK_DELETE}, {L"Home", VK_HOME}, {L"End", VK_END}, {L"PageUp", VK_PRIOR},
+    {L"PageDown", VK_NEXT}, {L"Up", VK_UP}, {L"Down", VK_DOWN}, {L"Left", VK_LEFT},
+    {L"Right", VK_RIGHT}, {L"Pause", VK_PAUSE}, {L"Backquote", VK_OEM_3}, {L"Minus", VK_OEM_MINUS},
+    {L"Equals", VK_OEM_PLUS}, {L"Comma", VK_OEM_COMMA}, {L"Period", VK_OEM_PERIOD}, {L"Slash", VK_OEM_2},
+    {L"Semicolon", VK_OEM_1}, {L"Quote", VK_OEM_7}, {L"LeftBracket", VK_OEM_4},
+    {L"RightBracket", VK_OEM_6}, {L"Backslash", VK_OEM_5},
+};
+
+bool SameHotkey(Hotkey a, Hotkey b) {
+    return a.modifiers == b.modifiers && a.vk == b.vk;
+}
+
+bool IsLetterOrDigit(UINT vk) {
+    return (vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9');
+}
+
+UINT KeyFromName(const wchar_t* name) {
+    if (name[0] && !name[1]) {
+        UINT c = towupper(name[0]);
+        if (IsLetterOrDigit(c))
+            return c;
+    }
+    if (!_wcsnicmp(name, L"Numpad", 6) && iswdigit(name[6]) && !name[7])
+        return VK_NUMPAD0 + (name[6] - L'0');
+    if ((name[0] == L'F' || name[0] == L'f') && iswdigit(name[1])) {
+        int n = _wtoi(name + 1);
+        if (n >= 1 && n <= 24)
+            return VK_F1 + n - 1;
+    }
+    for (const auto& key : kKeyNames)
+        if (!_wcsicmp(name, key.name))
+            return key.vk;
+    return 0;
+}
+
+// Writes the key's name, or returns false if the key can't be used in a hotkey.
+bool KeyName(UINT vk, wchar_t* out, size_t count) {
+    if (IsLetterOrDigit(vk)) {
+        swprintf_s(out, count, L"%c", vk);
+        return true;
+    }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+        swprintf_s(out, count, L"Numpad%u", vk - VK_NUMPAD0);
+        return true;
+    }
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        swprintf_s(out, count, L"F%u", vk - VK_F1 + 1);
+        return true;
+    }
+    for (const auto& key : kKeyNames) {
+        if (key.vk == vk) {
+            wcscpy_s(out, count, key.name);
+            return true;
+        }
+    }
+    return false;
+}
+
+// "Ctrl+Shift+Space"; with vk == 0, just the modifiers ("Ctrl+Shift+").
+void FormatHotkey(Hotkey hotkey, wchar_t* out, size_t count) {
+    out[0] = 0;
+    if (hotkey.modifiers & MOD_CONTROL) wcscat_s(out, count, L"Ctrl+");
+    if (hotkey.modifiers & MOD_ALT) wcscat_s(out, count, L"Alt+");
+    if (hotkey.modifiers & MOD_SHIFT) wcscat_s(out, count, L"Shift+");
+    if (hotkey.modifiers & MOD_WIN) wcscat_s(out, count, L"Win+");
+    wchar_t key[16];
+    if (hotkey.vk && KeyName(hotkey.vk, key, ARRAYSIZE(key)))
+        wcscat_s(out, count, key);
+}
+
+bool ParseHotkey(const wchar_t* text, Hotkey* hotkey) {
+    *hotkey = {};
+    wchar_t buffer[64];
+    wcsncpy_s(buffer, text, _TRUNCATE);
+    wchar_t* context = nullptr;
+    for (wchar_t* part = wcstok_s(buffer, L"+", &context); part; part = wcstok_s(nullptr, L"+", &context)) {
+        while (*part == L' ')
+            ++part;
+        size_t len = wcslen(part);
+        while (len && part[len - 1] == L' ')
+            part[--len] = 0;
+
+        if (!_wcsicmp(part, L"Ctrl") || !_wcsicmp(part, L"Control")) hotkey->modifiers |= MOD_CONTROL;
+        else if (!_wcsicmp(part, L"Alt")) hotkey->modifiers |= MOD_ALT;
+        else if (!_wcsicmp(part, L"Shift")) hotkey->modifiers |= MOD_SHIFT;
+        else if (!_wcsicmp(part, L"Win")) hotkey->modifiers |= MOD_WIN;
+        else if (hotkey->vk || !(hotkey->vk = KeyFromName(part)))
+            return false;
+    }
+    return hotkey->vk != 0;
+}
+
 // ---- Settings (%AppData%\QuickNote\settings.ini) ----
 
 void SaveSettings() {
     const Settings& s = g_settings;
+    wchar_t hotkey[64];
     WritePrivateProfileStringW(kAppName, L"NotesFolder", s.notesFolder, s.file);
-    WritePrivateProfileStringW(kAppName, L"Hotkey", s.hotkey, s.file);
+    FormatHotkey(s.noteHotkey, hotkey, ARRAYSIZE(hotkey));
+    WritePrivateProfileStringW(kAppName, L"Hotkey", hotkey, s.file);
+    FormatHotkey(s.folderHotkey, hotkey, ARRAYSIZE(hotkey));
+    WritePrivateProfileStringW(kAppName, L"FolderHotkey", hotkey, s.file);
     WritePrivateProfileStringW(kAppName, L"StartWithWindows", s.startWithWindows ? L"1" : L"0", s.file);
 }
 
@@ -107,58 +223,16 @@ void LoadSettings() {
     SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, defaultFolder);
     wcscat_s(defaultFolder, L"\\QuickNotes");
     GetPrivateProfileStringW(kAppName, L"NotesFolder", defaultFolder, s.notesFolder, MAX_PATH, s.file);
-    GetPrivateProfileStringW(kAppName, L"Hotkey", L"Ctrl+Space", s.hotkey, ARRAYSIZE(s.hotkey), s.file);
+    wchar_t hotkey[64];
+    GetPrivateProfileStringW(kAppName, L"Hotkey", L"", hotkey, ARRAYSIZE(hotkey), s.file);
+    if (!ParseHotkey(hotkey, &s.noteHotkey))
+        s.noteHotkey = kDefaultNoteHotkey;
+    GetPrivateProfileStringW(kAppName, L"FolderHotkey", L"", hotkey, ARRAYSIZE(hotkey), s.file);
+    if (!ParseHotkey(hotkey, &s.folderHotkey))
+        s.folderHotkey = kDefaultFolderHotkey;
     s.startWithWindows = GetPrivateProfileIntW(kAppName, L"StartWithWindows", 0, s.file) != 0;
-    if (firstRun)
-        SaveSettings();
-}
-
-// ---- Hotkey parsing ("Ctrl+Space", "Ctrl+Alt+N", ...) ----
-
-UINT KeyFromName(const wchar_t* name) {
-    if (name[0] && !name[1]) {
-        wchar_t c = towupper(name[0]);
-        if ((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9'))
-            return c;
-    }
-    if ((name[0] == L'F' || name[0] == L'f') && name[1]) {
-        int n = _wtoi(name + 1);
-        if (n >= 1 && n <= 24)
-            return VK_F1 + n - 1;
-    }
-    static const struct { const wchar_t* name; UINT vk; } keys[] = {
-        {L"Space", VK_SPACE}, {L"Enter", VK_RETURN}, {L"Tab", VK_TAB}, {L"Insert", VK_INSERT},
-        {L"Delete", VK_DELETE}, {L"Home", VK_HOME}, {L"End", VK_END}, {L"PageUp", VK_PRIOR},
-        {L"PageDown", VK_NEXT}, {L"Up", VK_UP}, {L"Down", VK_DOWN}, {L"Left", VK_LEFT},
-        {L"Right", VK_RIGHT}, {L"Backquote", VK_OEM_3},
-    };
-    for (const auto& key : keys)
-        if (!_wcsicmp(name, key.name))
-            return key.vk;
-    return 0;
-}
-
-bool ParseHotkey(const wchar_t* text, UINT* modifiers, UINT* vk) {
-    *modifiers = 0;
-    *vk = 0;
-    wchar_t buffer[64];
-    wcsncpy_s(buffer, text, _TRUNCATE);
-    wchar_t* context = nullptr;
-    for (wchar_t* part = wcstok_s(buffer, L"+", &context); part; part = wcstok_s(nullptr, L"+", &context)) {
-        while (*part == L' ')
-            ++part;
-        size_t len = wcslen(part);
-        while (len && part[len - 1] == L' ')
-            part[--len] = 0;
-
-        if (!_wcsicmp(part, L"Ctrl") || !_wcsicmp(part, L"Control")) *modifiers |= MOD_CONTROL;
-        else if (!_wcsicmp(part, L"Alt")) *modifiers |= MOD_ALT;
-        else if (!_wcsicmp(part, L"Shift")) *modifiers |= MOD_SHIFT;
-        else if (!_wcsicmp(part, L"Win")) *modifiers |= MOD_WIN;
-        else if (*vk || !(*vk = KeyFromName(part)))
-            return false;
-    }
-    return *vk != 0;
+    // Also fills in keys added since the file was written (FolderHotkey).
+    SaveSettings();
 }
 
 // ---- Tray icon ----
@@ -170,15 +244,28 @@ NOTIFYICONDATAW TrayData() {
     return nid;
 }
 
+void SetTrayTip(NOTIFYICONDATAW* nid) {
+    wchar_t hotkey[64];
+    FormatHotkey(g_settings.noteHotkey, hotkey, ARRAYSIZE(hotkey));
+    nid->uFlags |= NIF_TIP | NIF_SHOWTIP;
+    swprintf_s(nid->szTip, L"QuickNote (%ls)", hotkey);
+}
+
 void AddTrayIcon() {
     NOTIFYICONDATAW nid = TrayData();
-    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = g_icon;
-    swprintf_s(nid.szTip, L"QuickNote (%ls)", g_settings.hotkey);
+    SetTrayTip(&nid);
     Shell_NotifyIconW(NIM_ADD, &nid);
     nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &nid);
+}
+
+void UpdateTrayTip() {
+    NOTIFYICONDATAW nid = TrayData();
+    SetTrayTip(&nid);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 void ShowError(const wchar_t* message) {
@@ -190,7 +277,40 @@ void ShowError(const wchar_t* message) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+// ---- Global hotkeys ----
+
+void UnregisterHotkeys() {
+    UnregisterHotKey(g_messageWnd, kNoteHotkeyId);
+    UnregisterHotKey(g_messageWnd, kFolderHotkeyId);
+}
+
+void RegisterHotkeys() {
+    UnregisterHotkeys();
+    const Hotkey hotkeys[] = {g_settings.noteHotkey, g_settings.folderHotkey};
+    const int ids[] = {kNoteHotkeyId, kFolderHotkeyId};
+    for (int i = 0; i < 2; ++i) {
+        if (!RegisterHotKey(g_messageWnd, ids[i], hotkeys[i].modifiers | MOD_NOREPEAT, hotkeys[i].vk)) {
+            wchar_t name[64], message[256];
+            FormatHotkey(hotkeys[i], name, ARRAYSIZE(name));
+            swprintf_s(message, L"%ls is already used by another app. Pick another from the tray menu: "
+                                L"Change shortcuts…", name);
+            ShowError(message);
+        }
+    }
+}
+
+// True if no other app has taken this hotkey. Only meaningful while ours are unregistered.
+bool HotkeyAvailable(Hotkey hotkey) {
+    if (!RegisterHotKey(g_messageWnd, kTestHotkeyId, hotkey.modifiers | MOD_NOREPEAT, hotkey.vk))
+        return false;
+    UnregisterHotKey(g_messageWnd, kTestHotkeyId);
+    return true;
+}
+
 // ---- Tray menu actions ----
+
+void ShowPopup();
+void StartShortcutRecording();
 
 void OpenNotesFolder() {
     SHCreateDirectoryExW(nullptr, g_settings.notesFolder, nullptr);
@@ -258,6 +378,7 @@ void ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, IDM_OPEN, L"Open notes folder");
     AppendMenuW(menu, MF_STRING, IDM_CHANGE, L"Change notes folder…");
+    AppendMenuW(menu, MF_STRING, IDM_SHORTCUTS, L"Change shortcuts…");
     AppendMenuW(menu, MF_STRING | (g_settings.startWithWindows ? MF_CHECKED : 0), IDM_STARTUP, L"Start with Windows");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
@@ -274,6 +395,10 @@ void ShowTrayMenu() {
     switch (command) {
     case IDM_OPEN: OpenNotesFolder(); break;
     case IDM_CHANGE: ChangeNotesFolder(); break;
+    case IDM_SHORTCUTS:
+        ShowPopup();
+        StartShortcutRecording();
+        break;
     case IDM_STARTUP: ToggleStartWithWindows(); break;
     case IDM_EXIT: PostQuitMessage(0); break;
     }
@@ -325,6 +450,15 @@ wchar_t* GetBoxText() {
     return text;
 }
 
+// Sets the box's text without recording it as an edit, and puts the caret at the end.
+void SetBoxText(const wchar_t* text) {
+    g_restoringText = true;
+    SetWindowTextW(g_edit, text);
+    g_restoringText = false;
+    int length = GetWindowTextLengthW(g_edit);
+    SendMessageW(g_edit, EM_SETSEL, length, length);
+}
+
 void PushHistory(History* history, wchar_t* text) {
     if (history->count == kHistoryDepth) {  // drop the oldest step
         FreeText(history->items[0]);
@@ -354,7 +488,7 @@ void ResetHistory() {
 // Called whenever the box's text changes. Typing is grouped into word-sized undo steps:
 // a new step starts at the first letter typed after a space, or after any non-typing edit.
 void RecordChange() {
-    if (g_restoringText)
+    if (g_restoringText || g_mode != Mode::Note)
         return;
     bool continuesWord = g_typing && g_lastChangeTyped && !(iswspace(g_lastTypedChar) && !iswspace(g_typedChar));
     if (continuesWord)
@@ -428,15 +562,152 @@ void DeleteWord(bool forward) {
     SendMessageW(g_edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
 }
 
+// ---- Shortcut recording (Ctrl+K in the box, or "Change shortcuts…" in the tray menu) ----
+
+bool IsModifierKey(UINT vk) {
+    switch (vk) {
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+    case VK_MENU: case VK_LMENU: case VK_RMENU:
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+    case VK_LWIN: case VK_RWIN:
+        return true;
+    }
+    return false;
+}
+
+UINT HeldModifiers() {
+    UINT modifiers = 0;
+    if (GetKeyState(VK_CONTROL) < 0) modifiers |= MOD_CONTROL;
+    if (GetKeyState(VK_MENU) < 0) modifiers |= MOD_ALT;
+    if (GetKeyState(VK_SHIFT) < 0) modifiers |= MOD_SHIFT;
+    if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) modifiers |= MOD_WIN;
+    return modifiers;
+}
+
+// Taking these over system-wide would break typing or everyday app shortcuts.
+bool IsCommonShortcut(Hotkey hotkey) {
+    if (hotkey.vk == VK_F4 && (hotkey.modifiers == MOD_ALT || hotkey.modifiers == MOD_CONTROL))
+        return true;  // close window / tab
+    return (hotkey.modifiers == MOD_CONTROL || hotkey.modifiers == MOD_ALT) && IsLetterOrDigit(hotkey.vk);
+}
+
+// Shift alone doesn't count: Shift+key just types. F13-F24 are free to use on their own.
+bool HasRequiredModifier(Hotkey hotkey) {
+    return (hotkey.modifiers & (MOD_CONTROL | MOD_ALT | MOD_WIN)) || (hotkey.vk >= VK_F13 && hotkey.vk <= VK_F24);
+}
+
+void ShowRecordingPrompt(UINT heldModifiers) {
+    bool noteStep = g_mode == Mode::RecordNoteHotkey;
+    const wchar_t* label = noteStep ? L"New note shortcut" : L"Open folder shortcut";
+    wchar_t keys[64], text[160];
+    if (heldModifiers) {
+        FormatHotkey({heldModifiers, 0}, keys, ARRAYSIZE(keys));
+        swprintf_s(text, L"%ls: %ls…", label, keys);
+    } else {
+        FormatHotkey(noteStep ? g_settings.noteHotkey : g_settings.folderHotkey, keys, ARRAYSIZE(keys));
+        swprintf_s(text, L"%ls: press keys · Enter keeps %ls", label, keys);
+    }
+    SetBoxText(text);
+    g_showingProblem = false;
+}
+
+void StartShortcutRecording() {
+    if (g_mode != Mode::Note)
+        return;
+    UnregisterHotkeys();  // so pressing the current shortcuts reaches the box
+    FreeText(g_noteBeforeRecording);
+    g_noteBeforeRecording = GetBoxText();
+    g_mode = Mode::RecordNoteHotkey;
+    SendMessageW(g_edit, EM_SETREADONLY, TRUE, 0);
+    ShowRecordingPrompt(0);
+}
+
+// Returns to the note box, with whatever was typed before Ctrl+K.
+void StopShortcutRecording() {
+    KillTimer(g_popup, kSavedTimerId);
+    if (g_mode != Mode::Saved)
+        RegisterHotkeys();
+    g_mode = Mode::Note;
+    SendMessageW(g_edit, EM_SETREADONLY, FALSE, 0);
+    SetBoxText(g_noteBeforeRecording ? g_noteBeforeRecording : L"");
+}
+
+void HidePopup();
+
+void HandleRecordingKey(UINT vk, bool down, bool repeat) {
+    if (repeat)
+        return;
+    if (g_mode == Mode::Saved) {
+        if (down && !IsModifierKey(vk))
+            HidePopup();
+        return;
+    }
+    UINT modifiers = HeldModifiers();
+    if (IsModifierKey(vk)) {
+        // Pressing a modifier starts a new attempt; releasing one leaves a rejection message readable.
+        if (down || !g_showingProblem)
+            ShowRecordingPrompt(modifiers);
+        return;
+    }
+    if (!down)
+        return;
+    if (vk == VK_ESCAPE && !modifiers) {
+        StopShortcutRecording();
+        return;
+    }
+
+    bool noteStep = g_mode == Mode::RecordNoteHotkey;
+    Hotkey current = noteStep ? g_settings.noteHotkey : g_settings.folderHotkey;
+    Hotkey hotkey = (vk == VK_RETURN && !modifiers) ? current : Hotkey{modifiers, vk};
+    wchar_t name[64], problem[160];
+    FormatHotkey(hotkey, name, ARRAYSIZE(name));
+    if (!KeyName(hotkey.vk, problem, ARRAYSIZE(problem)))
+        wcscpy_s(problem, L"That key can't be used — try another");
+    else if (!HasRequiredModifier(hotkey))
+        wcscpy_s(problem, L"Add Ctrl, Alt or Win — try again");
+    else if (IsCommonShortcut(hotkey))
+        swprintf_s(problem, L"%ls is a common app shortcut — try another", name);
+    else if (!noteStep && SameHotkey(hotkey, g_pendingNoteHotkey))
+        swprintf_s(problem, L"%ls is the new note shortcut — try another", name);
+    else if (!HotkeyAvailable(hotkey))
+        swprintf_s(problem, L"%ls is used by another app — try another", name);
+    else
+        problem[0] = 0;
+    if (problem[0]) {
+        SetBoxText(problem);
+        g_showingProblem = true;
+        return;
+    }
+
+    if (noteStep) {
+        g_pendingNoteHotkey = hotkey;
+        g_mode = Mode::RecordFolderHotkey;
+        ShowRecordingPrompt(0);
+        return;
+    }
+    g_settings.noteHotkey = g_pendingNoteHotkey;
+    g_settings.folderHotkey = hotkey;
+    SaveSettings();
+    RegisterHotkeys();
+    UpdateTrayTip();
+    g_mode = Mode::Saved;
+
+    wchar_t noteName[64], text[200];
+    FormatHotkey(g_settings.noteHotkey, noteName, ARRAYSIZE(noteName));
+    swprintf_s(text, L"Saved · New note: %ls · Open folder: %ls", noteName, name);
+    SetBoxText(text);
+    SetTimer(g_popup, kSavedTimerId, 2500, nullptr);
+}
+
 // ---- Popup ----
 
 void HidePopup() {
     if (g_hiding || !IsWindowVisible(g_popup))
         return;
     g_hiding = true;
-    g_restoringText = true;
-    SetWindowTextW(g_edit, L"");
-    g_restoringText = false;
+    if (g_mode != Mode::Note)
+        StopShortcutRecording();
+    SetBoxText(L"");
     ResetHistory();
     ShowWindow(g_popup, SW_HIDE);
     g_hiding = false;
@@ -475,6 +746,13 @@ void SubmitNote() {
 // Keyboard handling for the note box that the standard edit control lacks.
 // Returns true if the message was handled and shouldn't reach the control.
 bool HandleBoxMessage(const MSG& msg) {
+    bool keyDown = msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN;
+    bool keyUp = msg.message == WM_KEYUP || msg.message == WM_SYSKEYUP;
+    if (g_mode != Mode::Note) {
+        if (keyDown || keyUp)
+            HandleRecordingKey(static_cast<UINT>(msg.wParam), keyDown, keyDown && (msg.lParam & (1 << 30)));
+        return keyDown || keyUp || msg.message == WM_CHAR || msg.message == WM_SYSCHAR;
+    }
     if (msg.message == WM_CHAR) {
         g_typing = msg.wParam >= L' ';  // cleared again after the character is dispatched
         g_typedChar = static_cast<wchar_t>(msg.wParam);
@@ -493,6 +771,7 @@ bool HandleBoxMessage(const MSG& msg) {
     case 'A': if (ctrl) { SendMessageW(g_edit, EM_SETSEL, 0, -1); return true; } break;
     case 'Z': if (ctrl) { shift ? Redo() : Undo(); return true; } break;
     case 'Y': if (ctrl) { Redo(); return true; } break;
+    case 'K': if (ctrl) { StartShortcutRecording(); return true; } break;
     }
     return false;
 }
@@ -564,9 +843,14 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RecordChange();
         return 0;
     case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:  // the box is read-only while recording shortcuts
         SetTextColor(reinterpret_cast<HDC>(wParam), kTextColor);
         SetBkColor(reinterpret_cast<HDC>(wParam), kBackColor);
         return reinterpret_cast<LRESULT>(g_backBrush);
+    case WM_TIMER:
+        if (wParam == kSavedTimerId)
+            HidePopup();
+        return 0;
     case WM_CLOSE:  // Alt+F4 only hides; the window is reused for the app's lifetime
         HidePopup();
         return 0;
@@ -580,7 +864,9 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 LRESULT CALLBACK MessageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_HOTKEY:
-        if (IsWindowVisible(g_popup))
+        if (wParam == kFolderHotkeyId)
+            OpenNotesFolder();
+        else if (IsWindowVisible(g_popup))
             HidePopup();
         else
             ShowPopup();
@@ -633,7 +919,7 @@ void CreateWindows(HINSTANCE instance) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
-    // Only one copy may run, otherwise the second one can't register the hotkey.
+    // Only one copy may run, otherwise the second one can't register the hotkeys.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\QuickNote.SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
         return 0;
@@ -653,16 +939,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_settings.startWithWindows && !SetStartWithWindows(true))
         ShowError(L"Couldn't update the startup entry.");
 
-    UINT modifiers, vk;
-    wchar_t message[256];
-    if (!ParseHotkey(g_settings.hotkey, &modifiers, &vk)) {
-        swprintf_s(message, L"Couldn't understand the hotkey \"%ls\" in settings.ini.", g_settings.hotkey);
-        ShowError(message);
-    } else if (!RegisterHotKey(g_messageWnd, kHotkeyId, modifiers | MOD_NOREPEAT, vk)) {
-        swprintf_s(message, L"%ls is already used by another app. Change Hotkey in settings.ini and restart QuickNote.",
-                   g_settings.hotkey);
-        ShowError(message);
-    }
+    RegisterHotkeys();
 
     ResetHistory();
     MSG msg;
@@ -674,7 +951,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         g_typing = false;
     }
 
-    UnregisterHotKey(g_messageWnd, kHotkeyId);
+    UnregisterHotkeys();
     NOTIFYICONDATAW nid = TrayData();
     Shell_NotifyIconW(NIM_DELETE, &nid);
     CoUninitialize();
