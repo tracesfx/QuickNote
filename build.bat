@@ -15,14 +15,18 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 :build
 if not exist build mkdir build
 
+rem Resources (app icon).
+rc /nologo /fo build\quicknote.res quicknote.rc
+if errorlevel 1 exit /b 1
+
 rem /O1 /GS- /GR- /EHs-c-: optimise for size, drop security cookies, RTTI and exceptions.
 rem /MT + ucrt.lib ("hybrid CRT"): the small VC runtime is linked in, while the C runtime comes from
 rem ucrtbase.dll, which ships with Windows 10/11. No Visual C++ Redistributable is needed.
 rem Keep these flags unchanged: Smart App Control verdicts depend on the exact build output.
-cl /nologo /utf-8 /W4 /O1 /GS- /GR- /EHs-c- /MT /Gy /Gw /DUNICODE /D_UNICODE main.cpp ^
+cl /nologo /utf-8 /W4 /O1 /GS- /GR- /EHs-c- /MT /Gy /Gw /DUNICODE /D_UNICODE main.cpp build\quicknote.res ^
    /Fo:build\ /Fe:build\QuickNote.exe ^
    /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /MANIFEST:EMBED /MANIFESTINPUT:quicknote.manifest ^
    /NODEFAULTLIB:libucrt.lib ucrt.lib
 if errorlevel 1 exit /b 1
-del build\*.obj 2>nul
+del build\*.obj build\*.res 2>nul
 for %%f in (build\QuickNote.exe) do echo Built %%~ff (%%~zf bytes)

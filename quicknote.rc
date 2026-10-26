@@ -1,0 +1,4 @@
+#include <windows.h>
+
+// The app icon shown by Explorer.
+1 ICON "quicknote.ico"
