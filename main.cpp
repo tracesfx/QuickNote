@@ -49,6 +49,16 @@ const int kRecentCount = 3;
 const int kRecentHeight = 34, kRecentGap = 6;
 const BYTE kRecentAlpha[kRecentCount] = {210, 140, 75};
 
+// Animations, in milliseconds (distances in 96-DPI pixels). Skipped when Windows' animation effects are off.
+const UINT_PTR kAnimationTimerId = 1;  // on the message window
+const int kDrift = 8;                  // the box and notes settle downwards by this much when opening
+const double kOpenTime = 120, kRowDelay = 40, kRowStagger = 30;
+const double kCloseTime = 90;
+const double kSaveShiftTime = 160, kSaveHoldTime = 40, kSaveBoxFadeTime = 150;
+const double kHintFadeInTime = 200, kHintHoldTime = 3000, kHintFadeOutTime = 300;
+const BYTE kHintAlpha = 235;
+const int kHintHeight = 40;
+
 // Windows 11 DWM attributes, spelled out so older SDKs still build.
 const DWORD kDwmCornerPreference = 33, kDwmBorderColor = 34;
 const int kDwmCornerRound = 2;
@@ -78,20 +88,37 @@ UINT g_fontDpi;
 HBRUSH g_backBrush;
 HICON g_icon;
 UINT g_taskbarCreated;
-bool g_hiding;
 Mode g_mode = Mode::Note;
 Hotkey g_pendingNoteHotkey;
 wchar_t* g_noteBeforeRecording;  // restored if shortcut recording is cancelled
 bool g_showingProblem;           // a rejected shortcut's message stays up until the next key press
 
-// The last few notes, shown above the box, newest (and most opaque) first.
+// The last few notes, shown above the box, newest (and most opaque) first. The extra row holds a
+// just-saved note while it slides into the stack.
 struct RecentNote {
     wchar_t text[kMaxNoteLength + 1];
     wchar_t when[32];  // "14:32" for today's notes, otherwise the date
 };
-RecentNote g_recent[kRecentCount];
+const int kSavedRow = kRecentCount;
+RecentNote g_recent[kRecentCount + 1];
 int g_recentCount;
-HWND g_recentWnd[kRecentCount];
+HWND g_recentWnd[kRecentCount + 1];
+
+// Where ShowPopup placed the box and the note rows above it.
+struct Layout {
+    int x, y, width, rowHeight, gap, top;
+};
+Layout g_layout;
+
+// Hidden -> Shown (taking input) -> Closing (fading out, focus already handed back) -> Hidden.
+enum class PopupState { Hidden, Shown, Closing };
+PopupState g_popupState;
+HWND g_previousWindow;  // had the focus before the box opened
+
+bool g_firstRun;  // the settings file was just created
+HWND g_hint;
+HICON g_hintIcon;
+wchar_t g_hintText[96];
 
 // Undo history: the standard edit control only has a single undo step.
 struct History {
@@ -233,7 +260,7 @@ void LoadSettings() {
     wchar_t* name = wcsrchr(s.file, L'\\') + 1;
     wcscpy_s(name, MAX_PATH - (name - s.file), L"QuickNote.ini");
 
-    if (GetFileAttributesW(s.file) == INVALID_FILE_ATTRIBUTES && !CreateSettingsFile(s.file)) {
+    if (GetFileAttributesW(s.file) == INVALID_FILE_ATTRIBUTES && !(g_firstRun = CreateSettingsFile(s.file))) {
         // The exe's folder isn't writable (e.g. Program Files), so use %AppData%\QuickNote instead.
         wchar_t folder[MAX_PATH];
         SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, folder);
@@ -241,7 +268,7 @@ void LoadSettings() {
         CreateDirectoryW(folder, nullptr);
         swprintf_s(s.file, L"%ls\\QuickNote.ini", folder);
         if (GetFileAttributesW(s.file) == INVALID_FILE_ATTRIBUTES)
-            CreateSettingsFile(s.file);
+            g_firstRun = CreateSettingsFile(s.file);
     }
 
     wchar_t defaultFolder[MAX_PATH];
@@ -309,10 +336,12 @@ void UnregisterHotkeys() {
     UnregisterHotKey(g_messageWnd, kFolderHotkeyId);
 }
 
-void RegisterHotkeys() {
+// Returns whether the new-note shortcut was registered.
+bool RegisterHotkeys() {
     UnregisterHotkeys();
     const Hotkey hotkeys[] = {g_settings.noteHotkey, g_settings.folderHotkey};
     const int ids[] = {kNoteHotkeyId, kFolderHotkeyId};
+    bool noteRegistered = true;
     for (int i = 0; i < 2; ++i) {
         if (!RegisterHotKey(g_messageWnd, ids[i], hotkeys[i].modifiers | MOD_NOREPEAT, hotkeys[i].vk)) {
             wchar_t name[64], message[256];
@@ -320,8 +349,10 @@ void RegisterHotkeys() {
             swprintf_s(message, L"%ls is already used by another app. Pick another from the tray menu: "
                                 L"Change shortcuts…", name);
             ShowError(message);
+            noteRegistered = noteRegistered && i != 0;
         }
     }
+    return noteRegistered;
 }
 
 // True if no other app has taken this hotkey. Only meaningful while ours are unregistered.
@@ -762,7 +793,7 @@ void StopShortcutRecording() {
     SetBoxText(g_noteBeforeRecording ? g_noteBeforeRecording : L"");
 }
 
-void HidePopup();
+void HidePopup(bool saved = false);
 
 void HandleRecordingKey(UINT vk, bool down, bool repeat) {
     if (repeat)
@@ -829,20 +860,160 @@ void HandleRecordingKey(UINT vk, bool down, bool repeat) {
     SetTimer(g_popup, kSavedTimerId, 2500, nullptr);
 }
 
+// ---- Animation ----
+// Each window fades (layered alpha) and slides on its own track; one timer drives them all.
+
+enum class Then { Stay, Hide, FadeOut };
+struct Track {
+    HWND hwnd;
+    int x;
+    int fromAlpha, toAlpha, fromY, toY;
+    double start, duration;
+    Then then;
+    double hold, fadeOut;  // for Then::FadeOut: the pause before fading out, and the fade's length
+    bool active;
+    int alpha;  // as last applied
+};
+enum TrackId { kBoxTrack, kFirstRowTrack, kHintTrack = kFirstRowTrack + kRecentCount + 1, kTrackCount };
+Track g_tracks[kTrackCount];
+bool g_animate = true;  // Windows' "Animation effects" setting
+
+double NowMs() {
+    LARGE_INTEGER count, frequency;
+    QueryPerformanceCounter(&count);
+    QueryPerformanceFrequency(&frequency);
+    return count.QuadPart * 1000.0 / frequency.QuadPart;
+}
+
+void ApplyTrack(Track& t, double now) {
+    double p = t.duration > 0 ? (now - t.start) / t.duration : 1;
+    p = p < 0 ? 0 : p > 1 ? 1 : p;
+    double eased = 1 - (1 - p) * (1 - p) * (1 - p);  // ease-out cubic: quick start, gentle landing
+    int alpha = t.fromAlpha + static_cast<int>((t.toAlpha - t.fromAlpha) * eased);
+    if (alpha != t.alpha) {
+        SetLayeredWindowAttributes(t.hwnd, 0, static_cast<BYTE>(alpha), LWA_ALPHA);
+        t.alpha = alpha;
+    }
+    if (t.fromY != t.toY)
+        SetWindowPos(t.hwnd, nullptr, t.x, t.fromY + static_cast<int>((t.toY - t.fromY) * eased), 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    if (p < 1)
+        return;
+    if (t.then == Then::FadeOut) {
+        t.start += t.duration + t.hold;
+        t.duration = t.fadeOut;
+        t.fromAlpha = t.alpha;
+        t.toAlpha = 0;
+        t.fromY = t.toY;
+        t.then = Then::Hide;
+        return;
+    }
+    if (t.then == Then::Hide)
+        ShowWindow(t.hwnd, SW_HIDE);
+    t.active = false;
+}
+
+// Starts moving a window from one opacity and height to another. The first frame is applied at once.
+void Animate(int id, HWND hwnd, int x, int fromAlpha, int toAlpha, int fromY, int toY, double duration,
+             double delay = 0, Then then = Then::Stay, double hold = 0, double fadeOut = 0) {
+    if (!g_animate)
+        duration = delay = fadeOut = 0;
+    Track& t = g_tracks[id];
+    t = {hwnd, x, fromAlpha, toAlpha, fromY, toY, NowMs() + delay, duration, then, hold, fadeOut, true, -1};
+    ApplyTrack(t, NowMs());
+    SetTimer(g_messageWnd, kAnimationTimerId, USER_TIMER_MINIMUM, nullptr);
+}
+
+bool TracksRunning(int first, int last) {
+    for (int id = first; id <= last; ++id)
+        if (g_tracks[id].active)
+            return true;
+    return false;
+}
+
+void FinishClosing();
+
+void OnAnimationFrame() {
+    double now = NowMs();
+    for (Track& t : g_tracks)
+        if (t.active)
+            ApplyTrack(t, now);
+    if (g_popupState == PopupState::Closing && !TracksRunning(kBoxTrack, kHintTrack - 1))
+        FinishClosing();
+    if (!TracksRunning(0, kTrackCount - 1))
+        KillTimer(g_messageWnd, kAnimationTimerId);
+}
+
 // ---- Popup ----
 
-void HidePopup() {
-    if (g_hiding || !IsWindowVisible(g_popup))
-        return;
-    g_hiding = true;
-    if (g_mode != Mode::Note)
-        StopShortcutRecording();
-    SetBoxText(L"");
-    ResetHistory();
+int RowY(int slot) {  // slot -1 is the box itself
+    return g_layout.y - (slot + 1) * (g_layout.rowHeight + g_layout.gap);
+}
+
+void SetClickThrough(HWND hwnd, bool clickThrough) {
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, clickThrough ? style | WS_EX_TRANSPARENT : style & ~WS_EX_TRANSPARENT);
+}
+
+void FinishClosing() {
+    for (int id = kBoxTrack; id < kHintTrack; ++id)
+        g_tracks[id].active = false;
     for (HWND row : g_recentWnd)
         ShowWindow(row, SW_HIDE);
     ShowWindow(g_popup, SW_HIDE);
-    g_hiding = false;
+    SetClickThrough(g_popup, false);
+    SetBoxText(L"");
+    ResetHistory();
+    g_popupState = PopupState::Hidden;
+}
+
+// Hands the focus straight back, then fades out. After a save, the new note first slides up
+// into the stack of recent notes, pushing the oldest one out.
+void HidePopup(bool saved) {
+    if (g_popupState != PopupState::Shown)
+        return;
+    g_popupState = PopupState::Closing;
+    if (g_mode != Mode::Note)
+        StopShortcutRecording();
+    if (saved)
+        SetBoxText(L"");
+    SetClickThrough(g_popup, true);
+    if (GetForegroundWindow() == g_popup && IsWindow(g_previousWindow))
+        SetForegroundWindow(g_previousWindow);
+
+    const Layout& l = g_layout;
+    if (!saved) {
+        Animate(kBoxTrack, g_popup, l.x, g_tracks[kBoxTrack].alpha, 0, l.y, l.y, kCloseTime, 0, Then::Hide);
+        for (int i = 0; i < kRecentCount; ++i)
+            if (IsWindowVisible(g_recentWnd[i]))
+                Animate(kFirstRowTrack + i, g_recentWnd[i], l.x, g_tracks[kFirstRowTrack + i].alpha, 0, RowY(i),
+                        RowY(i), kCloseTime, 0, Then::Hide);
+        return;
+    }
+
+    Animate(kBoxTrack, g_popup, l.x, g_tracks[kBoxTrack].alpha, 0, l.y, l.y, kSaveBoxFadeTime, 0, Then::Hide);
+    for (int i = 0; i < kRecentCount; ++i) {
+        if (!IsWindowVisible(g_recentWnd[i]))
+            continue;
+        bool staysInStack = i + 1 < kRecentCount && RowY(i + 1) >= l.top;
+        Animate(kFirstRowTrack + i, g_recentWnd[i], l.x, g_tracks[kFirstRowTrack + i].alpha,
+                staysInStack ? kRecentAlpha[i + 1] : 0, RowY(i), RowY(i + 1), kSaveShiftTime, 0,
+                staysInStack ? Then::FadeOut : Then::Hide, kSaveHoldTime, kCloseTime);
+    }
+    if (RowY(0) >= l.top) {
+        HWND row = g_recentWnd[kSavedRow];
+        InvalidateRect(row, nullptr, TRUE);
+        Animate(kFirstRowTrack + kSavedRow, row, l.x, 0, kRecentAlpha[0], RowY(-1), RowY(0), kSaveShiftTime, 0,
+                Then::FadeOut, kSaveHoldTime, kCloseTime);
+        SetWindowPos(row, HWND_TOPMOST, l.x, RowY(-1), l.width, l.rowHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+// ---- First-run hint ----
+
+void HideHint() {
+    g_tracks[kHintTrack].active = false;
+    ShowWindow(g_hint, SW_HIDE);
 }
 
 void SubmitNote() {
@@ -871,6 +1042,13 @@ void SubmitNote() {
             ShowError(message);
             return;
         }
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        RecentNote& note = g_recent[kSavedRow];
+        wcscpy_s(note.text, start);
+        swprintf_s(note.when, L"%02u:%02u", t.wHour, t.wMinute);
+        HidePopup(true);
+        return;
     }
     HidePopup();
 }
@@ -921,13 +1099,14 @@ void ForceForeground(HWND hwnd) {
     }
 }
 
-// Centers the box horizontally, a quarter of the way down the monitor the cursor is on.
-void ShowPopup() {
+// The work area and DPI of the monitor the cursor is on. Also sizes the font for that DPI.
+UINT CursorMonitor(RECT* work) {
     POINT pt;
     GetCursorPos(&pt);
     HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO info = {sizeof info};
     GetMonitorInfoW(monitor, &info);
+    *work = info.rcWork;
     UINT dpi = 96, dpiY = 96;
     GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &dpiY);
 
@@ -940,6 +1119,25 @@ void ShowPopup() {
         SendMessageW(g_edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), FALSE);
         SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
     }
+    return dpi;
+}
+
+// Reads Windows' "Animation effects" setting (Settings > Accessibility > Visual effects).
+void ReadAnimationSetting() {
+    BOOL animate = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0);
+    g_animate = animate != FALSE;
+}
+
+// Centers the box horizontally, a quarter of the way down the monitor the cursor is on.
+// It fades in while settling into place, then the recent notes follow one after another.
+void ShowPopup() {
+    if (g_popupState == PopupState::Closing)
+        FinishClosing();
+    HideHint();
+    ReadAnimationSetting();
+    RECT work;
+    UINT dpi = CursorMonitor(&work);
 
     HDC dc = GetDC(g_edit);
     HGDIOBJ oldFont = SelectObject(dc, g_font);
@@ -950,28 +1148,87 @@ void ShowPopup() {
 
     int width = MulDiv(kPopupWidth, dpi, 96), height = MulDiv(kPopupHeight, dpi, 96);
     int padding = MulDiv(kPadding, dpi, 96), lineHeight = metrics.tmHeight + 2;
-    const RECT& work = info.rcWork;
-    int x = work.left + (work.right - work.left - width) / 2;
-    int y = work.top + (work.bottom - work.top) / 4;
+    int drift = MulDiv(kDrift, dpi, 96);
+    Layout& l = g_layout;
+    l = {work.left + (work.right - work.left - width) / 2, work.top + (work.bottom - work.top) / 4, width,
+         MulDiv(kRecentHeight, dpi, 96), MulDiv(kRecentGap, dpi, 96), static_cast<int>(work.top)};
 
-    SetWindowPos(g_popup, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+    // Starts transparent: the window is shown at once (so typing goes straight in) and fades in.
+    Animate(kBoxTrack, g_popup, l.x, 0, 255, l.y - drift, l.y, kOpenTime);
+    SetWindowPos(g_popup, HWND_TOPMOST, l.x, l.y - drift, width, height, SWP_NOACTIVATE);
     SetWindowPos(g_edit, nullptr, padding, (height - lineHeight) / 2, width - 2 * padding, lineHeight, SWP_NOZORDER);
 
     // The last notes stack upwards from the box, fading out the older they are.
     LoadRecentNotes();
-    int rowHeight = MulDiv(kRecentHeight, dpi, 96), gap = MulDiv(kRecentGap, dpi, 96);
     for (int i = 0; i < kRecentCount; ++i) {
-        int rowY = y - (i + 1) * (rowHeight + gap);
-        if (i >= g_recentCount || rowY < work.top) {
-            ShowWindow(g_recentWnd[i], SW_HIDE);
+        if (i >= g_recentCount || RowY(i) < l.top)
             continue;
-        }
-        InvalidateRect(g_recentWnd[i], nullptr, TRUE);
-        SetWindowPos(g_recentWnd[i], HWND_TOPMOST, x, rowY, width, rowHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        HWND row = g_recentWnd[i];
+        InvalidateRect(row, nullptr, TRUE);
+        Animate(kFirstRowTrack + i, row, l.x, 0, kRecentAlpha[i], RowY(i) - drift, RowY(i), kOpenTime,
+                kRowDelay + i * kRowStagger);
+        SetWindowPos(row, HWND_TOPMOST, l.x, RowY(i) - drift, width, l.rowHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
+    g_previousWindow = GetForegroundWindow();
+    g_popupState = PopupState::Shown;
     ShowWindow(g_popup, SW_SHOW);
     ForceForeground(g_popup);
     SetFocus(g_edit);
+}
+
+// First run only: "QuickNote is running · press Ctrl+Space" fades in where the box appears,
+// then fades out after a few seconds (or as soon as the box opens).
+void ShowHint() {
+    ReadAnimationSetting();
+    RECT work;
+    UINT dpi = CursorMonitor(&work);
+    wchar_t hotkey[64];
+    FormatHotkey(g_settings.noteHotkey, hotkey, ARRAYSIZE(hotkey));
+    swprintf_s(g_hintText, L"QuickNote is running · press %ls", hotkey);
+
+    int iconSize = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+    if (g_hintIcon)
+        DestroyIcon(g_hintIcon);
+    LoadIconWithScaleDown(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(kIconId), iconSize, iconSize, &g_hintIcon);
+    HDC dc = GetDC(g_hint);
+    HGDIOBJ oldFont = SelectObject(dc, g_font);
+    SIZE text;
+    GetTextExtentPoint32W(dc, g_hintText, static_cast<int>(wcslen(g_hintText)), &text);
+    SelectObject(dc, oldFont);
+    ReleaseDC(g_hint, dc);
+
+    int padding = MulDiv(kPadding, dpi, 96), drift = MulDiv(kDrift, dpi, 96);
+    int width = padding + iconSize + padding * 2 / 3 + text.cx + padding, height = MulDiv(kHintHeight, dpi, 96);
+    int x = work.left + (work.right - work.left - width) / 2;
+    int y = work.top + (work.bottom - work.top) / 4 + (MulDiv(kPopupHeight, dpi, 96) - height) / 2;
+    Animate(kHintTrack, g_hint, x, 0, kHintAlpha, y - drift, y, kHintFadeInTime, 0, Then::FadeOut, kHintHoldTime,
+            kHintFadeOutTime);
+    SetWindowPos(g_hint, HWND_TOPMOST, x, y - drift, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+LRESULT CALLBACK HintProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rect;
+        GetClientRect(hwnd, &rect);
+        int padding = MulDiv(kPadding, g_fontDpi, 96);
+        int iconSize = GetSystemMetricsForDpi(SM_CXSMICON, g_fontDpi);
+        DrawIconEx(dc, padding, (rect.bottom - iconSize) / 2, g_hintIcon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
+        rect.left = padding + iconSize + padding * 2 / 3;
+        HGDIOBJ oldFont = SelectObject(dc, g_font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, kTextColor);
+        DrawTextW(dc, g_hintText, -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(dc, oldFont);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1014,7 +1271,7 @@ LRESULT CALLBACK RecentProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         int i = static_cast<int>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        if (i < g_recentCount) {
+        if (i < g_recentCount || i == kSavedRow) {
             const RecentNote& note = g_recent[i];
             RECT rect;
             GetClientRect(hwnd, &rect);
@@ -1047,10 +1304,14 @@ LRESULT CALLBACK MessageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_HOTKEY:
         if (wParam == kFolderHotkeyId)
             OpenNotesFolder();
-        else if (IsWindowVisible(g_popup))
+        else if (g_popupState == PopupState::Shown)
             HidePopup();
         else
             ShowPopup();
+        return 0;
+    case WM_TIMER:
+        if (wParam == kAnimationTimerId)
+            OnAnimationFrame();
         return 0;
     case WM_TRAY:
         switch (LOWORD(lParam)) {
@@ -1086,8 +1347,10 @@ void CreateWindows(HINSTANCE instance) {
     RegisterClassExW(&popupClass);
 
     // Tool window + no owner: never appears in the taskbar or Alt+Tab.
-    g_popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, popupClass.lpszClassName, kAppName, WS_POPUP,
-                              0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    // Layered so it can fade in and out.
+    g_popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, popupClass.lpszClassName, kAppName,
+                              WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    SetLayeredWindowAttributes(g_popup, 0, 0, LWA_ALPHA);
     DwmSetWindowAttribute(g_popup, kDwmCornerPreference, &kDwmCornerRound, sizeof kDwmCornerRound);
     DwmSetWindowAttribute(g_popup, kDwmBorderColor, &kBorderColor, sizeof kBorderColor);
 
@@ -1105,16 +1368,26 @@ void CreateWindows(HINSTANCE instance) {
     RegisterClassExW(&recentClass);
 
     // Layered for the fade, click-through, and never activated, so the box keeps the focus.
-    for (int i = 0; i < kRecentCount; ++i) {
-        HWND row = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-                                   recentClass.lpszClassName, kAppName, WS_POPUP, 0, 0, 0, 0, g_popup, nullptr,
-                                   instance, nullptr);
+    const DWORD overlayStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    for (int i = 0; i <= kSavedRow; ++i) {
+        HWND row = CreateWindowExW(overlayStyle, recentClass.lpszClassName, kAppName, WS_POPUP, 0, 0, 0, 0, g_popup,
+                                   nullptr, instance, nullptr);
         SetWindowLongPtrW(row, GWLP_USERDATA, i);
-        SetLayeredWindowAttributes(row, 0, kRecentAlpha[i], LWA_ALPHA);
+        SetLayeredWindowAttributes(row, 0, 0, LWA_ALPHA);
         DwmSetWindowAttribute(row, kDwmCornerPreference, &kDwmCornerRound, sizeof kDwmCornerRound);
         DwmSetWindowAttribute(row, kDwmBorderColor, &kBorderColor, sizeof kBorderColor);
         g_recentWnd[i] = row;
     }
+
+    WNDCLASSEXW hintClass = recentClass;
+    hintClass.lpfnWndProc = HintProc;
+    hintClass.lpszClassName = L"QuickNoteHint";
+    RegisterClassExW(&hintClass);
+    g_hint = CreateWindowExW(overlayStyle, hintClass.lpszClassName, kAppName, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
+                             instance, nullptr);
+    SetLayeredWindowAttributes(g_hint, 0, 0, LWA_ALPHA);
+    DwmSetWindowAttribute(g_hint, kDwmCornerPreference, &kDwmCornerRound, sizeof kDwmCornerRound);
+    DwmSetWindowAttribute(g_hint, kDwmBorderColor, &kBorderColor, sizeof kBorderColor);
 }
 
 }  // namespace
@@ -1140,7 +1413,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_settings.startWithWindows && !SetStartWithWindows(true))
         ShowError(L"Couldn't update the startup entry.");
 
-    RegisterHotkeys();
+    if (RegisterHotkeys() && g_firstRun)
+        ShowHint();
 
     ResetHistory();
     MSG msg;
